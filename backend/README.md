@@ -12,6 +12,7 @@
 | POST | `/send` | Отправить письмо (тело: `to`, `subject`, `body`, опционально `body_html`) |
 | GET | `/emails` | Входящие (параметры: `limit`, `mailbox`, по умолчанию INBOX) |
 | GET | `/emails/sent` | Отправленные (параметр: `limit`) |
+| POST | `/mvp/process-latest` | MVP-конвейер: взять последнее письмо -> AI-заглушка -> отправить оператору |
 
 ### Пример вызова от агента
 
@@ -31,6 +32,14 @@ GET /emails?limit=10
 **Чтение отправленных:**
 ```http
 GET /emails/sent?limit=10
+```
+
+**MVP-конвейер (последнее входящее -> оператор):**
+```http
+POST /mvp/process-latest
+Content-Type: application/json
+
+{"mailbox": "INBOX", "operator_email": "operator@example.com"}
 ```
 
 ## Локальный запуск
@@ -62,4 +71,4 @@ API: **http://localhost:8000**. Переменные окружения пере
 - `fetch_recent_emails_sent(limit=10)` — отправленные
 - `check_connection()` — проверка IMAP/SMTP
 
-Переменные: `EMAIL_USER`, `EMAIL_PASSWORD`, `IMAP_HOST`, `IMAP_PORT`, `SMTP_HOST`, `SMTP_PORT` (см. `.env.example`).
+Переменные: `EMAIL_USER`, `EMAIL_PASSWORD`, `IMAP_HOST`, `IMAP_PORT`, `SMTP_HOST`, `SMTP_PORT`, `OPERATOR_EMAIL` (см. `.env.example`).
