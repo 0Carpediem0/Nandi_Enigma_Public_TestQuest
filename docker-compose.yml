@@ -1,0 +1,25 @@
+# Запуск бэкенда с почтовым сервисом (IMAP/SMTP).
+# Сокомандники: после клона репо выполнить:
+#   docker compose up --build
+# Либо передать переменные из .env:
+#   cp backend/.env.example backend/.env  # отредактировать
+#   docker compose --env-file backend/.env up --build
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - backend/.env
+    # Переменные можно переопределить здесь или через .env в корне
+    environment:
+      - EMAIL_USER=${EMAIL_USER:-yegor.starkov.06@mail.ru}
+      - EMAIL_PASSWORD=${EMAIL_PASSWORD}
+      - IMAP_HOST=${IMAP_HOST:-imap.mail.ru}
+      - IMAP_PORT=${IMAP_PORT:-993}
+      - SMTP_HOST=${SMTP_HOST:-smtp.mail.ru}
+      - SMTP_PORT=${SMTP_PORT:-587}
+    # Для отладки: раскомментировать и подмонтировать код
+    # volumes:
+    #   - ./backend:/app
