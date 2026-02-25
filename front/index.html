@@ -29,6 +29,7 @@
           <th>Тип приборов</th>
           <th>Эмоциональный окрас</th>
           <th>Суть вопроса</th>
+          <th>Ответ AI</th>
         </tr>
       </thead>
       <!-- Важно: добавили id для JS -->
@@ -36,6 +37,25 @@
         <!-- Сюда JavaScript вставит строки -->
       </tbody>
     </table>
+  </div>
+
+  <div class="modal-overlay" id="detailsModal">
+    <div class="modal-window" role="dialog" aria-modal="true" aria-labelledby="detailsModalTitle">
+      <div class="modal-header">
+        <h2 id="detailsModalTitle">Детали обращения</h2>
+        <button type="button" class="modal-close-btn" id="closeDetailsModal" aria-label="Закрыть">×</button>
+      </div>
+      <div class="modal-content-grid">
+        <section class="modal-panel">
+          <h3>Суть вопроса</h3>
+          <p id="modalQuestionText">-</p>
+        </section>
+        <section class="modal-panel">
+          <h3>Ответ AI</h3>
+          <p id="modalAiText">-</p>
+        </section>
+      </div>
+    </div>
   </div>
 
   <script src="script.js"></script>
