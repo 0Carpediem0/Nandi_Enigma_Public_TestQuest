@@ -1,21 +1,21 @@
 """
 Сервис работы с почтой через IMAP (чтение) и SMTP (отправка).
-По умолчанию: yegor.starkov.06@mail.ru (Mail.ru).
+По умолчанию: Rambler.
 Учётные данные и серверы задаются через переменные окружения или .env.
 """
 
 import os
 import imaplib
 import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from email import policy
+from email.header import Header, decode_header, make_header
+from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import formatdate, make_msgid
 from typing import Optional
 
-# Почта по умолчанию (Mail.ru)
-DEFAULT_STUB_EMAIL = "yegor.starkov.06@mail.ru"
+# Почта по умолчанию (Rambler)
+DEFAULT_STUB_EMAIL = "user@rambler.ru"
 
 
 def _get_config() -> dict:
@@ -23,11 +23,53 @@ def _get_config() -> dict:
     return {
         "email": os.getenv("EMAIL_USER", DEFAULT_STUB_EMAIL),
         "password": os.getenv("EMAIL_PASSWORD", ""),
-        "imap_host": os.getenv("IMAP_HOST", "imap.mail.ru"),
+        "imap_host": os.getenv("IMAP_HOST", "imap.rambler.ru"),
         "imap_port": int(os.getenv("IMAP_PORT", "993")),
-        "smtp_host": os.getenv("SMTP_HOST", "smtp.mail.ru"),
+        "smtp_host": os.getenv("SMTP_HOST", "smtp.rambler.ru"),
         "smtp_port": int(os.getenv("SMTP_PORT", "587")),
     }
+
+
+def _decode_header_value(value: str) -> str:
+    """Декодирует MIME-заголовки (=?utf-8?...?=) в обычный Unicode-текст."""
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return value
+
+
+def _extract_text_body(msg) -> str:
+    """Достаёт текст письма с учётом charset и multipart."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            if part.get_content_disposition() == "attachment":
+                continue
+            if part.get_content_type() != "text/plain":
+                continue
+            try:
+                return part.get_content()
+            except Exception:
+                payload = part.get_payload(decode=True) or b""
+                charset = part.get_content_charset() or "utf-8"
+                try:
+                    return payload.decode(charset, errors="replace")
+                except Exception:
+                    return payload.decode("utf-8", errors="replace")
+        return ""
+
+    try:
+        return msg.get_content()
+    except Exception:
+        payload = msg.get_payload(decode=True) or b""
+        charset = msg.get_content_charset() or "utf-8"
+        try:
+            return payload.decode(charset, errors="replace")
+        except Exception:
+            return payload.decode("utf-8", errors="replace")
 
 
 def fetch_recent_emails(limit: int = 10, mailbox: str = "INBOX") -> list[dict]:
@@ -57,19 +99,15 @@ def fetch_recent_emails(limit: int = 10, mailbox: str = "INBOX") -> list[dict]:
                     continue
                 raw = msg_data[0][1]
                 msg = BytesParser(policy=policy.default).parsebytes(raw)
-                body = ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() == "text/plain":
-                            body = (part.get_payload(decode=True) or b"").decode(errors="replace")
-                            break
-                else:
-                    body = (msg.get_payload(decode=True) or b"").decode(errors="replace")
+                body = _extract_text_body(msg)
                 result.append({
-                    "subject": msg.get("Subject", ""),
-                    "from_addr": msg.get("From", ""),
-                    "to_addr": msg.get("To", ""),
+                    "subject": _decode_header_value(msg.get("Subject", "")),
+                    "from_addr": _decode_header_value(msg.get("From", "")),
+                    "to_addr": _decode_header_value(msg.get("To", "")),
                     "date": msg.get("Date", ""),
+                    "message_id": _decode_header_value(msg.get("Message-ID", "")).strip(),
+                    "in_reply_to": _decode_header_value(msg.get("In-Reply-To", "")).strip(),
+                    "body": body or "",
                     "body_preview": (body or "")[:500],
                 })
     except Exception as e:
@@ -80,22 +118,21 @@ def fetch_recent_emails(limit: int = 10, mailbox: str = "INBOX") -> list[dict]:
 def send_email(to_addr: str, subject: str, body: str, body_html: Optional[str] = None) -> dict:
     """
     Отправляет письмо через SMTP. Пробует порт 465 (SSL), затем 587 (STARTTLS).
-    Для Mail.ru: если не отправляется — создай «Пароль для внешних приложений» в настройках почты.
+    Для Rambler: если включена 2FA, используй специальный пароль для почтового клиента.
     """
     cfg = _get_config()
     if not cfg["password"]:
         return {"ok": False, "error": "EMAIL_PASSWORD not set", "stub": cfg["email"]}
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
+    msg = EmailMessage()
+    msg["Subject"] = str(Header(subject, "utf-8"))
     msg["From"] = cfg["email"]
     msg["To"] = to_addr
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain="mail.ru")
-    msg["MIME-Version"] = "1.0"
-    msg.attach(MIMEText(body, "plain", "utf-8"))
+    msg["Message-ID"] = make_msgid(domain="rambler.ru")
+    msg.set_content(body, subtype="plain", charset="utf-8")
     if body_html:
-        msg.attach(MIMEText(body_html, "html", "utf-8"))
+        msg.add_alternative(body_html, subtype="html", charset="utf-8")
 
     last_error = None
 
@@ -120,7 +157,7 @@ def send_email(to_addr: str, subject: str, body: str, body_html: Optional[str] =
     err_text = str(last_error) if last_error else "unknown"
     hint = ""
     if "535" in err_text or "Authentication" in err_text or "auth" in err_text.lower():
-        hint = " Подсказка: Mail.ru может требовать «Пароль для внешних приложений» (Настройки → Безопасность)."
+        hint = " Подсказка: проверь логин/пароль и доступ к почтовым клиентам в настройках Rambler."
     return {"ok": False, "error": err_text + hint, "stub": cfg["email"]}
 
 
@@ -152,15 +189,14 @@ def list_mailboxes() -> list[str]:
 
 def fetch_recent_emails_sent(limit: int = 10) -> list[dict]:
     """
-    Последние письма из папки «Отправленные». Пробует варианты имени папки (в т.ч. Mail.ru UTF-7).
+    Последние письма из папки «Отправленные». Пробует варианты имени папки.
     """
-    # Mail.ru «Отправленные» в IMAP — &BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-
     for folder in (
-        "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-",  # Mail.ru Отправленные
         "Sent",
         "Sent Items",
         "Отправленные",
-        "[Mail.ru]/Sent",
+        "Sent Messages",
+        "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-",
         "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0-",
     ):
         emails = fetch_recent_emails(limit=limit, mailbox=folder)

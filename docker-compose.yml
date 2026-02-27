@@ -1,28 +1,41 @@
-# Запуск бэкенда с почтовым сервисом (IMAP/SMTP).
-# Сокомандники: после клона репо выполнить:
-#   docker compose up --build
-# Либо передать переменные из .env:
-#   cp backend/.env.example backend/.env  # отредактировать
-#   docker compose --env-file backend/.env up --build
-
+# Запуск бэкенда с почтой и PostgreSQL
 services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${PGDATABASE:-test}
+      - POSTGRES_USER=${PGUSER:-postgres}
+      - POSTGRES_PASSWORD=${PGPASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-postgres} -d ${PGDATABASE:-test}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
     env_file:
       - backend/.env
-    # Переменные можно переопределить здесь или через .env в корне
+    # Только PG* задаём здесь для docker-сети.
+    # EMAIL/IMAP/SMTP/OPERATOR берутся из backend/.env (env_file).
     environment:
-      - EMAIL_USER=${EMAIL_USER:-yegor.starkov.06@mail.ru}
-      - EMAIL_PASSWORD=${EMAIL_PASSWORD}
-      - IMAP_HOST=${IMAP_HOST:-imap.mail.ru}
-      - IMAP_PORT=${IMAP_PORT:-993}
-      - SMTP_HOST=${SMTP_HOST:-smtp.mail.ru}
-      - SMTP_PORT=${SMTP_PORT:-587}
-      - OPERATOR_EMAIL=${OPERATOR_EMAIL:-operator@example.com}
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=${PGUSER:-postgres}
+      - PGPASSWORD=${PGPASSWORD:-postgres}
+      - PGDATABASE=${PGDATABASE:-test}
     ports:
       - "8000:8000"
-    # Для отладки: раскомментировать и подмонтировать код
-    # volumes:
-    #   - ./backend:/app
+
+volumes:
+  pg_data:

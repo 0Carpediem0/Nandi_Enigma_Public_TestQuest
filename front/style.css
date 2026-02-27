@@ -50,6 +50,20 @@ header {
   opacity: 0.8;
 }
 
+.nav_link_btn {
+  margin: auto 16px auto auto;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #4258ff;
+  color: #fff;
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.nav_link_btn:hover {
+  opacity: 0.9;
+}
+
 .container {
   padding: 40px;
   overflow-x: auto;
@@ -210,4 +224,93 @@ body.modal-open {
   word-break: break-word;
   color: #333;
   line-height: 1.45;
+}
+
+.modal-actions-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.modal-actions-panel textarea,
+.modal-actions-panel select {
+  width: 100%;
+  border: 1px solid #cfd3e6;
+  border-radius: 8px;
+  padding: 8px;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.modal-actions button {
+  border: 1px solid #4258ff;
+  background: #4258ff;
+  color: #fff;
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+#modalActionStatus {
+  font-size: 12px;
+  color: #333;
+}
+
+.operator_page {
+  font-family: sans-serif;
+  color: #222;
+  background: #f5f6fa;
+  min-height: 100vh;
+}
+
+.operator_layout {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.operator_card {
+  background: #fff;
+  border: 1px solid #e6e8f1;
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.operator_grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.operator_card input,
+.operator_card select,
+.operator_card textarea {
+  width: 100%;
+  border: 1px solid #cfd3e6;
+  border-radius: 8px;
+  padding: 8px;
+  font-size: 13px;
+}
+
+.operator_actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.operator_actions button {
+  border: 1px solid #4258ff;
+  background: #4258ff;
+  color: #fff;
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
 }
