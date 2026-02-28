@@ -3,7 +3,17 @@ import getpass
 import os
 import sys
 import traceback
+from pathlib import Path
 from typing import Iterable
+
+# Подгрузить backend/.env для PGHOST, PGPASSWORD и т.д.
+_backend_env = Path(__file__).resolve().parent / "backend" / ".env"
+if _backend_env.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_backend_env, override=True)
+    except ImportError:
+        pass
 
 import psycopg
 from psycopg import Connection as PgConnection
@@ -86,16 +96,23 @@ def create_schema(
                 "Удаление старых таблиц",
             )
 
-        # Расширения
-        # vector обязателен для embedding vector(384)
+        # Расширения (vector опционален — если нет pgvector, таблица knowledge_base создаётся без колонки embedding)
+        has_pgvector = True
         with conn.cursor() as cur:
             print("\n== Расширения ==")
             print("[1] CREATE EXTENSION IF NOT EXISTS pg_trgm ...")
             cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
 
             print("[2] CREATE EXTENSION IF NOT EXISTS vector ...")
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-            print("OK")
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                print("OK")
+            except Exception as e:
+                if "vector" in str(e).lower() or "not available" in str(e).lower():
+                    has_pgvector = False
+                    print("(пропущено: pgvector не установлен)")
+                else:
+                    raise
 
         schema_statements = [
             """
@@ -216,6 +233,35 @@ def create_schema(
             "CREATE INDEX IF NOT EXISTS idx_kb_usage ON knowledge_base(usage_count DESC);",
             "CREATE INDEX IF NOT EXISTS idx_ai_run_log_ticket_id ON ai_run_log(ticket_id);",
             "CREATE INDEX IF NOT EXISTS idx_ai_run_log_created_at ON ai_run_log(created_at DESC);",
+        ]
+
+        KB_TABLE_NO_VECTOR = """
+            CREATE TABLE IF NOT EXISTS knowledge_base (
+                id SERIAL PRIMARY KEY,
+                title VARCHAR(500) NOT NULL,
+                content TEXT NOT NULL,
+                short_answer TEXT,
+                tags TEXT[],
+                category VARCHAR(100),
+                keywords TEXT[],
+                usage_count INTEGER DEFAULT 0,
+                success_rate FLOAT DEFAULT 1.0,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                search_vector tsvector GENERATED ALWAYS AS (
+                    setweight(to_tsvector('simple', coalesce(title,'')), 'A') ||
+                    setweight(to_tsvector('simple', coalesce(content,'')), 'B')
+                ) STORED
+            );
+            """
+        if not has_pgvector:
+            schema_statements = [
+                (KB_TABLE_NO_VECTOR if "embedding vector(384)" in s and "knowledge_base" in s else s)
+                for s in schema_statements
+            ]
+
+        schema_statements.extend([
             """
             CREATE TABLE IF NOT EXISTS feedback (
                 id SERIAL PRIMARY KEY,
@@ -231,7 +277,7 @@ def create_schema(
             "CREATE INDEX IF NOT EXISTS idx_feedback_ticket ON feedback(ticket_id);",
             "CREATE INDEX IF NOT EXISTS idx_feedback_kb ON feedback(kb_id);",
             "CREATE INDEX IF NOT EXISTS idx_feedback_helpful ON feedback(is_helpful);",
-        ]
+        ])
 
         exec_many(conn, schema_statements, "Создание таблиц и индексов")
 

@@ -52,6 +52,7 @@ def generate_draft(question: str, category: str, context_items: list[dict]) -> d
         generated = generator(
             prompt,
             max_new_tokens=AIConfig.QWEN_MAX_NEW_TOKENS,
+            max_length=None,
             temperature=AIConfig.QWEN_TEMPERATURE,
             do_sample=AIConfig.QWEN_TEMPERATURE > 0,
             return_full_text=False,

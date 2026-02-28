@@ -12,6 +12,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from ai_config import AIConfig
 from ai_embedding import text_to_vector_384
@@ -46,8 +47,8 @@ _env_dir = Path(__file__).resolve().parent
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(_env_dir / ".env")
-    load_dotenv()
+    load_dotenv(_env_dir / ".env", override=True)
+    load_dotenv(override=True)
 except ImportError:
     pass
 
@@ -449,6 +450,15 @@ def api_mvp_process_batch(req: ProcessBatchEmailsRequest):
         operator_email=operator_email,
         digest_sent=digest_sent,
     )
+
+
+# Раздача фронта (index.html, operator.html и т.д.)
+_static_dir = Path(__file__).resolve().parent.parent / "front"
+if not _static_dir.is_dir():
+    _static_dir = Path(__file__).resolve().parent / "static"
+if _static_dir.is_dir():
+    app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="static")
+    logger.info("Serving frontend from %s", _static_dir)
 
 
 if __name__ == "__main__":
