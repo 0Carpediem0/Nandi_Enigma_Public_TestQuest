@@ -1,7 +1,10 @@
+import logging
 import os
 from contextlib import contextmanager
 
 import psycopg
+
+logger = logging.getLogger("support_api")
 
 
 def get_db_config() -> dict:
@@ -17,6 +20,7 @@ def get_db_config() -> dict:
 @contextmanager
 def get_connection():
     cfg = get_db_config()
+    logger.info("DB connect: host=%s port=%s user=%s dbname=%s", cfg["host"], cfg["port"], cfg["user"], cfg["dbname"])
     conn = psycopg.connect(
         host=cfg["host"],
         port=cfg["port"],
@@ -33,9 +37,23 @@ def get_connection():
 
 
 def init_db() -> None:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                has_pgvector = True
+            except Exception as e:
+                if "vector" in str(e).lower() or "not available" in str(e).lower():
+                    has_pgvector = False
+                    import logging
+                    logging.getLogger("support_api").warning(
+                        "pgvector не установлен — расширение vector пропущено. Поиск по embedding в KB будет недоступен. Ошибка: %s", e
+                    )
+                else:
+                    raise
+
     statements = [
-        "CREATE EXTENSION IF NOT EXISTS vector;",
-        "CREATE EXTENSION IF NOT EXISTS pg_trgm;",
         """
         CREATE TABLE IF NOT EXISTS operators (
             id SERIAL PRIMARY KEY,
@@ -196,8 +214,36 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_ai_run_log_created_at ON ai_run_log(created_at DESC);",
     ]
 
+    # Таблица knowledge_base без колонки embedding (если pgvector недоступен)
+    kb_create_no_vector = """
+        CREATE TABLE IF NOT EXISTS knowledge_base (
+            id SERIAL PRIMARY KEY,
+            ticket_id INTEGER REFERENCES tickets(id) ON DELETE SET NULL,
+            title VARCHAR(500) NOT NULL,
+            content TEXT NOT NULL,
+            short_answer TEXT,
+            tags TEXT[],
+            category VARCHAR(100),
+            usage_count INTEGER DEFAULT 0,
+            success_rate FLOAT DEFAULT 1.0,
+            keywords TEXT[],
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            search_vector tsvector GENERATED ALWAYS AS (
+                setweight(to_tsvector('simple', coalesce(title,'')), 'A') ||
+                setweight(to_tsvector('simple', coalesce(content,'')), 'B')
+            ) STORED
+        );
+        """
+
     with get_connection() as conn:
         with conn.cursor() as cur:
             for stmt in statements:
+                if not has_pgvector and ("vector(384)" in stmt or "embedding vector" in stmt):
+                    continue
+                if not has_pgvector and "CREATE TABLE IF NOT EXISTS knowledge_base" in stmt and "embedding" in stmt:
+                    cur.execute(kb_create_no_vector)
+                    continue
                 cur.execute(stmt)
 

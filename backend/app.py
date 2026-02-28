@@ -69,13 +69,6 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-def startup_event():
-    logger.info("Initializing database schema")
-    init_db()
-    logger.info("Database schema initialized")
-
-
 def _ingest_single_email(email_item: dict) -> int:
     ticket_id, created = create_or_update_ticket_from_email(email_item)
     create_email_log(
@@ -293,25 +286,17 @@ def api_export_tickets(status: str | None = None):
     )
 
 
-# --- Existing MVP endpoint expanded with DB ---
-@app.post("/mvp/process-latest", response_model=ProcessLatestEmailResponse)
-def api_mvp_process_latest(req: ProcessLatestEmailRequest):
-    operator_email = req.operator_email or os.getenv("OPERATOR_EMAIL")
-    if not operator_email:
-        raise HTTPException(
-            status_code=400,
-            detail="Operator email is not set. Pass operator_email in request or set OPERATOR_EMAIL in env.",
-        )
-
-    emails = fetch_recent_emails(limit=1, mailbox=req.mailbox)
+# --- MVP: один цикл «забрать последнее письмо → AI → отправить оператору» ---
+def _do_mvp_process_latest(operator_email: str, mailbox: str = "INBOX") -> dict | None:
+    """Забирает последнее письмо, прогоняет через AI, шлёт черновик оператору. Возвращает None если писем нет или ошибка."""
+    emails = fetch_recent_emails(limit=1, mailbox=mailbox)
     if not emails:
-        raise HTTPException(status_code=404, detail="No emails found in selected mailbox.")
+        return None
     if len(emails) == 1 and "error" in emails[0]:
-        raise HTTPException(status_code=400, detail=f"IMAP error: {emails[0]['error']}")
-
+        logger.warning("MVP cycle: IMAP error %s", emails[0].get("error"))
+        return None
     latest_email = emails[0]
     ticket_id, ai_result = _process_email_to_ticket(latest_email)
-
     operator_subject = f"[MVP][AI] {ai_result['subject']}"
     operator_body = (
         f"Ticket ID: {ticket_id}\n"
@@ -329,7 +314,6 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         "Черновик ответа от AI:\n"
         f"{ai_result['draft_answer']}\n"
     )
-
     send_result = send_email(operator_email, operator_subject, operator_body)
     create_email_log(
         ticket_id=ticket_id,
@@ -343,13 +327,62 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         send_status="ok" if send_result.get("ok") else "error",
         error_text=send_result.get("error"),
     )
+    return {
+        "ticket_id": ticket_id,
+        "ai_result": ai_result,
+        "send_ok": send_result.get("ok"),
+        "operator_email": operator_email,
+    }
 
-    if not send_result.get("ok"):
+
+def _poll_email_worker():
+    """Фоновый поток: каждые N секунд забирает последнее письмо и обрабатывает с AI."""
+    import time
+    interval = int(os.getenv("POLL_EMAIL_EVERY_SEC", "0"))
+    if interval <= 0:
+        return
+    operator_email = os.getenv("OPERATOR_EMAIL")
+    if not operator_email:
+        logger.warning("POLL_EMAIL_EVERY_SEC задан, но OPERATOR_EMAIL пуст — опрос почты отключён")
+        return
+    logger.info("Запуск фонового опроса почты каждые %s с, письма оператору: %s", interval, operator_email)
+    while True:
+        time.sleep(interval)
+        try:
+            result = _do_mvp_process_latest(operator_email, "INBOX")
+            if result:
+                logger.info("Опрос: обработан ticket_id=%s, отправлено оператору: %s", result["ticket_id"], result["operator_email"])
+        except Exception as e:
+            logger.exception("Опрос почты (ошибка): %s", e)
+
+
+@app.on_event("startup")
+def startup_event():
+    logger.info("Initializing database schema")
+    init_db()
+    logger.info("Database schema initialized")
+    poll_sec = int(os.getenv("POLL_EMAIL_EVERY_SEC", "0"))
+    if poll_sec > 0:
+        import threading
+        threading.Thread(target=_poll_email_worker, daemon=True).start()
+
+
+@app.post("/mvp/process-latest", response_model=ProcessLatestEmailResponse)
+def api_mvp_process_latest(req: ProcessLatestEmailRequest):
+    operator_email = req.operator_email or os.getenv("OPERATOR_EMAIL")
+    if not operator_email:
         raise HTTPException(
             status_code=400,
-            detail=f"SMTP error: {send_result.get('error', 'unknown send error')}",
+            detail="Operator email is not set. Pass operator_email in request or set OPERATOR_EMAIL in env.",
         )
-
+    result = _do_mvp_process_latest(operator_email, req.mailbox)
+    if result is None:
+        raise HTTPException(status_code=404, detail="No emails found in selected mailbox.")
+    ai_result = result["ai_result"]
+    ticket_id = result["ticket_id"]
+    send_ok = result["send_ok"]
+    if not send_ok:
+        raise HTTPException(status_code=400, detail="SMTP error when sending to operator.")
     logger.info("MVP processed ticket_id=%s and sent to operator=%s", ticket_id, operator_email)
     return ProcessLatestEmailResponse(
         ok=True,
@@ -367,7 +400,7 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         ai_sources=ai_result.get("sources", []),
         pipeline_version=ai_result.get("pipeline_version"),
         timings_ms=ai_result.get("timings_ms", {}),
-        sent_via_port=send_result.get("port"),
+        sent_via_port=None,
     )
 
 
