@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Оператор - ЭРИС</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body class="operator_page">
+  <header class="header_eris">
+    <img src="./logo.svg" alt="Логотип ЭРИС" class="logo" />
+    <a class="nav_link_btn" href="./index.html">Перейти к веб-таблице</a>
+  </header>
+
+  <main class="operator_layout">
+    <section class="operator_card">
+      <h2>Операторская заглушка</h2>
+      <p>Здесь вынесены действия оператора: обновление тикета, отправка ответа, сохранение в базу знаний.</p>
+    </section>
+
+    <section class="operator_card">
+      <h3>Выбор тикета</h3>
+      <div class="operator_grid">
+        <div>
+          <label for="ticketSelect">Тикет</label>
+          <select id="ticketSelect"></select>
+        </div>
+        <div>
+          <label for="statusSelect">Статус</label>
+          <select id="statusSelect">
+            <option value="new">new</option>
+            <option value="drafted">drafted</option>
+            <option value="sent">sent</option>
+            <option value="saved_to_kb">saved_to_kb</option>
+          </select>
+        </div>
+      </div>
+    </section>
+
+    <section class="operator_card">
+      <h3>Ответ оператора</h3>
+      <textarea id="replyText" rows="8" placeholder="Введите финальный ответ клиенту"></textarea>
+      <div class="operator_actions">
+        <button type="button" id="updateBtn">Сохранить тикет</button>
+        <button type="button" id="replyBtn">Отправить ответ</button>
+        <button type="button" id="kbBtn">Сохранить в KB</button>
+      </div>
+      <p id="operatorStatus">-</p>
+    </section>
+  </main>
+
+  <script src="./operator.js"></script>
+</body>
+</html>

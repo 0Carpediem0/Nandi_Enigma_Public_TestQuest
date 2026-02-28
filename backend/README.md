@@ -1,6 +1,6 @@
 # Backend — почтовый API для AI-агента
 
-Почта: **yegor.starkov.06@mail.ru** (Mail.ru). Учётные данные — в `backend/.env` (см. `.env.example`).
+Почта: **Rambler**. Учётные данные — в `backend/.env` (см. `.env.example`).
 
 ## API для AI-агента
 
@@ -12,6 +12,13 @@
 | POST | `/send` | Отправить письмо (тело: `to`, `subject`, `body`, опционально `body_html`) |
 | GET | `/emails` | Входящие (параметры: `limit`, `mailbox`, по умолчанию INBOX) |
 | GET | `/emails/sent` | Отправленные (параметр: `limit`) |
+| POST | `/emails/ingest` | Забрать письма из IMAP и создать/обновить тикеты в БД |
+| GET | `/tickets` | Список тикетов для web UI |
+| GET | `/tickets/{id}` | Детали тикета |
+| PATCH | `/tickets/{id}` | Обновление тикета оператором |
+| POST | `/tickets/{id}/reply` | Отправка финального ответа клиенту |
+| POST | `/tickets/{id}/save-to-kb` | Сохранение кейса в базу знаний |
+| GET | `/tickets/export` | Экспорт тикетов в CSV |
 | POST | `/mvp/process-latest` | MVP-конвейер: взять последнее письмо -> AI-заглушка -> отправить оператору |
 
 ### Пример вызова от агента
@@ -62,7 +69,18 @@ cp backend/.env.example backend/.env   # отредактировать
 docker compose up --build
 ```
 
-API: **http://localhost:8000**. Переменные окружения передаются из `backend/.env`.
+Поднимутся сервисы:
+- `backend` — API на `http://localhost:8000`
+- `postgres` — БД на `localhost:5432`
+
+Переменные окружения передаются из `backend/.env` (`EMAIL_*`, `IMAP_*`, `SMTP_*`, `OPERATOR_EMAIL`, `PG*`).
+
+## Быстрый smoke-сценарий
+
+1. `POST /emails/ingest?limit=5` — подтянуть свежие письма в таблицу `tickets`.
+2. `GET /tickets` — убедиться, что тикеты есть в UI-формате.
+3. `POST /tickets/{id}/reply` — отправить ответ клиенту.
+4. `POST /tickets/{id}/save-to-kb` — сохранить кейс в `knowledge_base`.
 
 ## Модуль email_service (внутренний)
 

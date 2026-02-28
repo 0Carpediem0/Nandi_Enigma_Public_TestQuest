@@ -1,84 +1,91 @@
-const API_URL = 'http://localhost:8000/tickets';
+const API_BASE = 'http://localhost:8000';
+const API_TICKETS = `${API_BASE}/tickets`;
+
+async function apiFetch(url, options = {}) {
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || 'Ошибка API');
+  }
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    return response.json();
+  }
+  return response.text();
+}
 
 async function fetchTickets() {
   try {
-    const response = await fetch(API_URL);
-    
-    if (!response.ok) throw new Error('Нет соединения с API');
-    
-    const data = await response.json();
+    const data = await apiFetch(API_TICKETS);
     renderTable(data);
   } catch (error) {
-    console.warn('Бэкенд не найден, используем тестовые данные:', error);
-    const mockData = getMockData();
-    renderTable(mockData);
+    console.warn('Бэкенд недоступен, используем тестовые данные:', error);
+    renderTable(getMockData());
   }
 }
 
 function renderTable(tickets) {
   const tbody = document.getElementById('tableBody');
-  tbody.innerHTML = ''; 
+  tbody.innerHTML = '';
 
   tickets.forEach(ticket => {
     const row = document.createElement('tr');
     const normalizedTone = normalizeTone(ticket.emotional_tone);
     const questionText = String(ticket.question || '-');
     const aiResponseText = String(ticket.ai_response || '-');
+
+    row.dataset.ticketId = String(ticket.id || '');
     row.dataset.question = questionText;
     row.dataset.aiResponse = aiResponseText;
+    row.dataset.status = String(ticket.status || 'new');
+    row.dataset.email = String(ticket.email || '');
 
     row.innerHTML = `
       <td>${formatDate(ticket.date)}</td>
-      <td>${ticket.full_name}</td>
-      <td>${ticket.object}</td>
-      <td>${ticket.phone}</td>
-      <td>${ticket.email}</td>
-      <td>${ticket.serial_numbers}</td>
-      <td>${ticket.device_type}</td>
+      <td>${escapeHtml(ticket.full_name || '-')}</td>
+      <td>${escapeHtml(ticket.object || '-')}</td>
+      <td>${escapeHtml(ticket.phone || '-')}</td>
+      <td>${escapeHtml(ticket.email || '-')}</td>
+      <td>${escapeHtml(ticket.serial_numbers || '-')}</td>
+      <td>${escapeHtml(ticket.device_type || '-')}</td>
       <td><span class="badge badge-${getToneClass(normalizedTone)}">${normalizedTone}</span></td>
       <td class="expandable-cell">${buildPreviewCell(questionText)}</td>
       <td class="expandable-cell">${buildPreviewCell(aiResponseText)}</td>
     `;
-    
+
     tbody.appendChild(row);
   });
 }
 
-// Тестовые данные
 function getMockData() {
   return [
     {
-      date: "2026-02-25T12:24:00",
-      full_name: "Иванов Иван Иванович",
-      object: "Завод №5",
-      phone: "+7 (999) 123-45-67",
-      email: "ivanov@zavod5.ru",
-      serial_numbers: "GA-12345, GA-12346",
-      device_type: "Газоанализатор ГАНК-4",
-      emotional_tone: "Негативный",
-      question: "Не включается насос...",
-      ai_response: "Проверьте питание, предохранитель и выполните перезапуск контроллера по инструкции."
+      id: 1,
+      date: '2026-02-25T12:24:00',
+      full_name: 'Иванов Иван Иванович',
+      object: 'Завод №5',
+      phone: '+7 (999) 123-45-67',
+      email: 'ivanov@zavod5.ru',
+      serial_numbers: 'GA-12345, GA-12346',
+      device_type: 'Газоанализатор ГАНК-4',
+      emotional_tone: 'Негативный',
+      status: 'new',
+      question: 'Не включается насос...',
+      ai_response: 'Проверьте питание, предохранитель и выполните перезапуск контроллера.',
     },
-    {
-      date: "2026-02-25T14:44:00",
-      full_name: "Петрова Мария Сергеевна",
-      object: "Цех обработки",
-      phone: "+7 (999) 765-43-21",
-      email: "petrova@zavod5.ru",
-      serial_numbers: "GA-78901",
-      device_type: "Датчик давления ДД-100",
-      emotional_tone: "Нейтральный",
-      question: "Как починить прибор?",
-      ai_response: "Уточните симптомы и серийный номер, затем проверьте калибровку и состояние датчика."
-    }
   ];
 }
 
 function formatDate(dateString) {
+  if (!dateString) return '-';
   const date = new Date(dateString);
-  return date.toLocaleString('ru-RU', { 
-    day: '2-digit', month: '2-digit', year: 'numeric', 
-    hour: '2-digit', minute: '2-digit' 
+  if (Number.isNaN(date.getTime())) return '-';
+  return date.toLocaleString('ru-RU', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
   });
 }
 
@@ -135,9 +142,9 @@ function setupPopup() {
     document.body.classList.remove('modal-open');
   };
 
-  const openModal = (questionText, aiText) => {
-    questionNode.textContent = questionText || '-';
-    aiNode.textContent = aiText || '-';
+  const openModal = (row) => {
+    questionNode.textContent = row.dataset.question || '-';
+    aiNode.textContent = row.dataset.aiResponse || '-';
     modal.classList.add('is-open');
     document.body.classList.add('modal-open');
   };
@@ -147,7 +154,7 @@ function setupPopup() {
     if (!button) return;
     const row = button.closest('tr');
     if (!row) return;
-    openModal(row.dataset.question, row.dataset.aiResponse);
+    openModal(row);
   });
 
   closeButton.addEventListener('click', closeModal);
@@ -232,8 +239,6 @@ document.addEventListener('DOMContentLoaded', () => {
   fetchTickets();
 });
 
-
-
 function exportTableToExcel() {
   const tbody = document.getElementById('tableBody');
   const rows = tbody.querySelectorAll('tr');
@@ -267,7 +272,6 @@ function exportTableToExcel() {
   });
 
   const wb = XLSX.utils.book_new();
-
   const ws = XLSX.utils.aoa_to_sheet(data);
 
   ws['!cols'] = [

@@ -56,6 +56,20 @@ header {
   opacity: 0.8;
 }
 
+.nav_link_btn {
+  margin: auto 16px auto auto;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #4258ff;
+  color: #fff;
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.nav_link_btn:hover {
+  opacity: 0.9;
+}
+
 .container {
   padding: 40px;
   overflow-x: auto;

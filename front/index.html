@@ -3,16 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>База знаний - ЭРИС</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <title>Веб-таблица - ЭРИС</title>
     <link rel="stylesheet" href="./style.css">
     <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
 </head>
 <body>
   <header class="header_eris">
     <img src="./logo.svg" alt="Логотип ЭРИС" class="logo"/>
+    <a class="nav_link_btn" href="./operator.html">Страница оператора</a>
     <button class="button_save" onclick="exportTableToExcel()" title="Скачать XLSX">
       <img src="./savebutton.svg" alt="Загрузка файла" class="">
     </button>
@@ -70,11 +68,11 @@
       </div>
       <div class="modal-content-grid">
         <section class="modal-panel">
-          <h3>Суть вопроса</h3>
+          <h3>Лог обращения</h3>
           <p id="modalQuestionText">-</p>
         </section>
         <section class="modal-panel">
-          <h3>Ответ AI</h3>
+          <h3>Лог AI-ответа</h3>
           <p id="modalAiText">-</p>
         </section>
       </div>
