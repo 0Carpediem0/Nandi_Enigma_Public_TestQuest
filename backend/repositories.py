@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from email.utils import parseaddr
 from typing import Any
@@ -239,18 +240,52 @@ def search_knowledge_base(
                     """,
                     (query, query, limit),
                 )
+                rows = cur.fetchall()
+                if not rows:
+                    raise ValueError("no rows")
             except Exception:
-                cur.execute(
-                    """
-                    SELECT id, title, content, short_answer, category, 1.0 AS rank
-                    FROM knowledge_base
-                    WHERE is_active = TRUE
-                      AND (title ILIKE %s OR content ILIKE %s)
-                    LIMIT %s
-                    """,
-                    (pattern, pattern, limit),
-                )
-            rows = cur.fetchall()
+                rows = []
+            if not rows:
+                words = [
+                    w
+                    for w in re.split(r"\W+", query)
+                    if len(w) >= 2 and not any(c in w for c in "'&!()")
+                ]
+                words = words[:10]
+                if words:
+                    or_parts = " | ".join(w for w in words)
+                    try:
+                        cur.execute(
+                            """
+                            SELECT
+                                id, title, content, short_answer, category,
+                                ts_rank(search_vector, to_tsquery('russian', %s)) AS rank
+                            FROM knowledge_base
+                            WHERE is_active = TRUE
+                              AND search_vector @@ to_tsquery('russian', %s)
+                            ORDER BY rank DESC
+                            LIMIT %s
+                            """,
+                            (or_parts, or_parts, limit),
+                        )
+                        rows = cur.fetchall()
+                    except Exception:
+                        pass
+            if not rows:
+                try:
+                    cur.execute(
+                        """
+                        SELECT id, title, content, short_answer, category, 1.0 AS rank
+                        FROM knowledge_base
+                        WHERE is_active = TRUE
+                          AND (title ILIKE %s OR content ILIKE %s)
+                        LIMIT %s
+                        """,
+                        (pattern, pattern, limit),
+                    )
+                    rows = cur.fetchall()
+                except Exception:
+                    rows = []
     return [_kb_row_to_dict(r) for r in rows]
 
 
