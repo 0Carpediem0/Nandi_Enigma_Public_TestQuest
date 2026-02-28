@@ -59,3 +59,34 @@ class SaveToKbRequest(BaseModel):
     category: str | None = None
     tags: list[str] | None = None
 
+
+class KnowledgeBaseEntry(BaseModel):
+    """Одна запись из поиска по базе знаний."""
+    id: int
+    title: str
+    content: str
+    short_answer: str | None = None
+    category: str | None = None
+    rank: float | None = None
+
+
+class KnowledgeBaseSearchResponse(BaseModel):
+    """Ответ API поиска по базе знаний."""
+    query: str
+    count: int
+    entries: list[KnowledgeBaseEntry]
+
+
+class KbAskRequest(BaseModel):
+    """Запрос ответа на вопрос клиента (поиск в БЗ + Qwen)."""
+    question: str = Field(..., min_length=1, description="Вопрос клиента")
+    limit: int = Field(5, ge=1, le=10, description="Сколько записей из БЗ подставлять в контекст")
+
+
+class KbAskResponse(BaseModel):
+    """Ответ на вопрос: сгенерированный текст и источники из базы знаний."""
+    question: str
+    answer: str
+    source_ids: list[int] = Field(default_factory=list, description="id записей knowledge_base, по которым сформирован ответ")
+    fallback: bool = Field(False, description="True, если ответ взят из short_answer (Qwen недоступен или не вернул текст)")
+

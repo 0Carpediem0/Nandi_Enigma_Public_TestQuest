@@ -21,10 +21,16 @@ from repositories import (
     get_ticket,
     list_tickets,
     mark_ticket_sent,
+    search_knowledge_base,
     set_ai_result,
     update_ticket,
 )
+from qwen_service import ask_qwen
 from schemas import (
+    KnowledgeBaseEntry,
+    KnowledgeBaseSearchResponse,
+    KbAskRequest,
+    KbAskResponse,
     ProcessLatestEmailRequest,
     ProcessLatestEmailResponse,
     ReplyTicketRequest,
@@ -221,6 +227,86 @@ def api_reply_ticket(ticket_id: int, req: ReplyTicketRequest):
     mark_ticket_sent(ticket_id, req.body)
     logger.info("Ticket %s replied to %s", ticket_id, to_email)
     return {"ok": True, "ticket_id": ticket_id, "to": to_email, "port": result.get("port")}
+
+
+# --- База знаний (поиск для Qwen и клиентов) ---
+@app.get("/kb/search", response_model=KnowledgeBaseSearchResponse)
+def api_kb_search(q: str = "", limit: int = 5):
+    """
+    Поиск по базе знаний по тексту вопроса клиента.
+    Возвращает топ-N релевантных записей (id, title, content, short_answer, category).
+    Используется для подбора контекста перед запросом к Qwen.
+    """
+    entries = search_knowledge_base(query=q, limit=limit)
+    return KnowledgeBaseSearchResponse(
+        query=q,
+        count=len(entries),
+        entries=[KnowledgeBaseEntry(**e) for e in entries],
+    )
+
+
+def _build_kb_context(entries: list[dict]) -> str:
+    """Собирает контекст из записей БЗ для системного промпта Qwen."""
+    if not entries:
+        return "В базе знаний нет релевантных записей."
+    parts = []
+    for e in entries:
+        title = e.get("title") or "Без названия"
+        content = (e.get("content") or "").strip()
+        parts.append(f"--- Тема: {title} ---\n{content}")
+    return "\n\n".join(parts)
+
+
+@app.post("/kb/ask", response_model=KbAskResponse)
+def api_kb_ask(req: KbAskRequest):
+    """
+    Вопрос клиента → поиск в базе знаний → контекст в Qwen → ответ.
+    Если Qwen отключён или недоступен, возвращается short_answer первой подходящей записи (fallback=True).
+    """
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question не может быть пустым")
+
+    entries = search_knowledge_base(query=question, limit=req.limit)
+    source_ids = [e["id"] for e in entries]
+
+    if not entries:
+        return KbAskResponse(
+            question=question,
+            answer="По вашему запросу в базе знаний ничего не найдено. Обратитесь к оператору.",
+            source_ids=[],
+            fallback=True,
+        )
+
+    system_prompt = (
+        "Ты — помощник техподдержки. Отвечай только на основе приведённой ниже информации из базы знаний. "
+        "Отвечай кратко, по существу, на русском языке. Не придумывай факты.\n\n"
+        + _build_kb_context(entries)
+    )
+    answer = ask_qwen(system_prompt, question)
+
+    if answer:
+        return KbAskResponse(
+            question=question,
+            answer=answer,
+            source_ids=source_ids,
+            fallback=False,
+        )
+
+    # Fallback: первый short_answer или начало content
+    first = entries[0]
+    fallback_text = first.get("short_answer") or (first.get("content") or "")[:500]
+    if fallback_text:
+        fallback_text = fallback_text.strip()
+    if not fallback_text:
+        fallback_text = "Ответ по вашему запросу временно недоступен. Обратитесь к оператору."
+    logger.info("Qwen unavailable or empty response, using fallback for question=%s", question[:50])
+    return KbAskResponse(
+        question=question,
+        answer=fallback_text,
+        source_ids=source_ids,
+        fallback=True,
+    )
 
 
 @app.post("/tickets/{ticket_id}/save-to-kb")
