@@ -438,7 +438,8 @@ def create_schema(
                     setweight(to_tsvector('russian', coalesce(content,'')), 'B')
                 ) STORED
             );
-            """,
+            """
+            ),
             "CREATE INDEX IF NOT EXISTS idx_kb_tags ON knowledge_base USING GIN (tags);",
             "CREATE INDEX IF NOT EXISTS idx_kb_category ON knowledge_base(category);",
             "CREATE INDEX IF NOT EXISTS idx_kb_is_active ON knowledge_base(is_active);",

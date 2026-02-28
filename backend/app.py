@@ -76,6 +76,39 @@ def startup_event():
     logger.info("Database schema initialized")
 
 
+def _get_draft_from_kb_qwen(question: str, limit: int = 5) -> str:
+    """
+    Черновик ответа по базе знаний + Qwen (та же логика, что в /kb/ask).
+    Если по запросу ничего не найдено или Qwen недоступен — возвращает fallback-текст.
+    """
+    question = (question or "").strip()
+    if not question:
+        return (
+            "Здравствуйте! Получили ваше обращение. Обратитесь к оператору для уточнения запроса."
+        )
+    entries = search_knowledge_base(query=question, limit=limit, use_vector=False)
+    if not entries:
+        return (
+            "Здравствуйте! По вашему запросу в базе знаний ничего не найдено. "
+            "Ответьте на это письмо или обратитесь к оператору."
+        )
+    system_prompt = (
+        "Ты — помощник техподдержки. Отвечай только на основе приведённой ниже информации из базы знаний. "
+        "Отвечай кратко, по существу, на русском языке. Не придумывай факты.\n\n"
+        + _build_kb_context(entries)
+    )
+    answer = ask_qwen(system_prompt, question)
+    if answer:
+        return answer
+    first = entries[0]
+    fallback = first.get("short_answer") or (first.get("content") or "")[:500]
+    if fallback:
+        return fallback.strip()
+    return (
+        "Здравствуйте! Ответ по вашему запросу временно недоступен. Обратитесь к оператору."
+    )
+
+
 def _run_ai_stub(email_item: dict) -> dict:
     subject = str(email_item.get("subject", "")).strip()
     from_addr = str(email_item.get("from_addr", "")).strip()
@@ -101,11 +134,9 @@ def _run_ai_stub(email_item: dict) -> dict:
         tone = "Нейтральный"
         needs_attention = False
 
-    draft_answer = (
-        "Здравствуйте! Получили ваше обращение. "
-        "Проверьте, пожалуйста, модель устройства и серийный номер в карточке оборудования. "
-        "Если проблема останется, ответьте на это письмо — подключим оператора."
-    )
+    # Черновик ответа из базы знаний + Qwen (вопрос = тема + текст письма)
+    question_for_kb = f"{subject} {body_preview}".strip()[:2000]
+    draft_answer = _get_draft_from_kb_qwen(question_for_kb, limit=5)
 
     return {
         "from_addr": from_addr or "unknown",
@@ -397,18 +428,18 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
     ai_result = _run_ai_stub(latest_email)
     set_ai_result(ticket_id, ai_result)
 
-    operator_subject = f"[MVP][AI-STUB] {ai_result['subject']}"
+    operator_subject = f"[MVP] {ai_result['subject']}"
     operator_body = (
         f"Ticket ID: {ticket_id}\n"
-        "MVP-обработка входящего письма\n\n"
+        "Обработка входящего письма (база знаний + Qwen)\n\n"
         f"От: {ai_result['from_addr']}\n"
         f"Тема: {ai_result['subject']}\n"
-        f"Категория (stub): {ai_result['category']}\n"
-        f"Приоритет (stub): {ai_result['priority']}\n"
-        f"Уверенность (stub): {ai_result['confidence']}\n\n"
-        "Краткое содержимое письма:\n"
+        f"Категория: {ai_result['category']}\n"
+        f"Приоритет: {ai_result['priority']}\n"
+        f"Уверенность: {ai_result['confidence']}\n\n"
+        "Содержимое письма:\n"
         f"{ai_result['body_preview']}\n\n"
-        "Черновик ответа от AI-заглушки:\n"
+        "Черновик ответа (база знаний + Qwen):\n"
         f"{ai_result['draft_answer']}\n"
     )
 
