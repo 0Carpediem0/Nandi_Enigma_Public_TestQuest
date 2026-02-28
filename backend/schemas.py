@@ -81,6 +81,7 @@ class KbAskRequest(BaseModel):
     """Запрос ответа на вопрос клиента (поиск в БЗ + Qwen)."""
     question: str = Field(..., min_length=1, description="Вопрос клиента")
     limit: int = Field(5, ge=1, le=10, description="Сколько записей из БЗ подставлять в контекст")
+    use_vector: bool = Field(False, description="Семантический поиск по эмбеддингам (если заполнены)")
 
 
 class KbAskResponse(BaseModel):

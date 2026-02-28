@@ -6,6 +6,11 @@ from psycopg.rows import dict_row
 
 from db import get_connection
 
+try:
+    from embedding_service import get_embedding
+except ImportError:
+    get_embedding = None
+
 
 def _ticket_to_front(ticket: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -168,16 +173,55 @@ def mark_ticket_sent(ticket_id: int, final_answer: str) -> None:
             )
 
 
-def search_knowledge_base(query: str, limit: int = 5) -> list[dict[str, Any]]:
+def _kb_row_to_dict(r: dict) -> dict[str, Any]:
+    return {
+        "id": r["id"],
+        "title": r["title"],
+        "content": r["content"],
+        "short_answer": r.get("short_answer"),
+        "category": r.get("category"),
+        "rank": float(r["rank"]) if r.get("rank") is not None else None,
+    }
+
+
+def search_knowledge_base(
+    query: str,
+    limit: int = 5,
+    use_vector: bool = False,
+) -> list[dict[str, Any]]:
     """
-    Поиск по базе знаний: по тексту вопроса клиента возвращает топ-N релевантных записей.
-    Использует полнотекстовый поиск (search_vector) и ts_rank; при отсутствии search_vector — ILIKE.
+    Поиск по базе знаний. По умолчанию — полнотекст (russian).
+    При use_vector=True и заполненных embedding — семантический поиск (pgvector).
     """
     query = (query or "").strip()
     if not query:
         return []
     limit = max(1, min(limit, 20))
     pattern = f"%{query.replace('%', '\\%').replace('_', '\\_')}%"
+
+    if use_vector and get_embedding:
+        emb = get_embedding(query)
+        if emb and len(emb) == 384:
+            vec_str = "[" + ",".join(str(x) for x in emb) + "]"
+            with get_connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    try:
+                        cur.execute(
+                            """
+                            SELECT id, title, content, short_answer, category,
+                                   (1 - (embedding <=> %s::vector)) AS rank
+                            FROM knowledge_base
+                            WHERE is_active = TRUE AND embedding IS NOT NULL
+                            ORDER BY embedding <=> %s::vector
+                            LIMIT %s
+                            """,
+                            (vec_str, vec_str, limit),
+                        )
+                        rows = cur.fetchall()
+                        if rows:
+                            return [_kb_row_to_dict(r) for r in rows]
+                    except Exception:
+                        pass
 
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -186,17 +230,16 @@ def search_knowledge_base(query: str, limit: int = 5) -> list[dict[str, Any]]:
                     """
                     SELECT
                         id, title, content, short_answer, category,
-                        ts_rank(search_vector, plainto_tsquery('simple', %s)) AS rank
+                        ts_rank(search_vector, plainto_tsquery('russian', %s)) AS rank
                     FROM knowledge_base
                     WHERE is_active = TRUE
-                      AND search_vector @@ plainto_tsquery('simple', %s)
+                      AND search_vector @@ plainto_tsquery('russian', %s)
                     ORDER BY rank DESC
                     LIMIT %s
                     """,
                     (query, query, limit),
                 )
             except Exception:
-                # Колонка search_vector отсутствует (таблица создана через backend/db.py) — fallback на ILIKE
                 cur.execute(
                     """
                     SELECT id, title, content, short_answer, category, 1.0 AS rank
@@ -208,18 +251,53 @@ def search_knowledge_base(query: str, limit: int = 5) -> list[dict[str, Any]]:
                     (pattern, pattern, limit),
                 )
             rows = cur.fetchall()
+    return [_kb_row_to_dict(r) for r in rows]
 
-    return [
-        {
-            "id": r["id"],
-            "title": r["title"],
-            "content": r["content"],
-            "short_answer": r.get("short_answer"),
-            "category": r.get("category"),
-            "rank": float(r["rank"]) if r.get("rank") is not None else None,
-        }
-        for r in rows
-    ]
+
+def fill_knowledge_base_embeddings() -> tuple[int, int]:
+    """
+    Заполняет колонку embedding для записей knowledge_base, где embedding IS NULL.
+    Использует HF Inference API (feature-extraction). Возвращает (обновлено, ошибок).
+    """
+    if not get_embedding:
+        return 0, 0
+    updated = 0
+    errors = 0
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            try:
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'knowledge_base'"
+                )
+                if "embedding" not in {r[0] for r in cur.fetchall()}:
+                    return 0, 0
+            except Exception:
+                return 0, 0
+            cur.execute(
+                "SELECT id, title, content FROM knowledge_base WHERE embedding IS NULL"
+            )
+            rows = cur.fetchall()
+    for r in rows:
+        text = f"{r.get('title') or ''} {r.get('content') or ''}".strip()[:8192]
+        if not text:
+            continue
+        emb = get_embedding(text)
+        if not emb or len(emb) != 384:
+            errors += 1
+            continue
+        vec_str = "[" + ",".join(str(x) for x in emb) + "]"
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "UPDATE knowledge_base SET embedding = %s::vector, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                        (vec_str, r["id"]),
+                    )
+                    updated += 1
+                except Exception:
+                    errors += 1
+    return updated, errors
 
 
 def create_kb_entry(

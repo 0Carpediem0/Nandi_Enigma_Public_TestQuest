@@ -18,6 +18,7 @@ from repositories import (
     create_email_log,
     create_kb_entry,
     create_or_update_ticket_from_email,
+    fill_knowledge_base_embeddings,
     get_ticket,
     list_tickets,
     mark_ticket_sent,
@@ -231,18 +232,26 @@ def api_reply_ticket(ticket_id: int, req: ReplyTicketRequest):
 
 # --- База знаний (поиск для Qwen и клиентов) ---
 @app.get("/kb/search", response_model=KnowledgeBaseSearchResponse)
-def api_kb_search(q: str = "", limit: int = 5):
+def api_kb_search(q: str = "", limit: int = 5, use_vector: bool = False):
     """
-    Поиск по базе знаний по тексту вопроса клиента.
-    Возвращает топ-N релевантных записей (id, title, content, short_answer, category).
-    Используется для подбора контекста перед запросом к Qwen.
+    Поиск по базе знаний. use_vector=true — семантический поиск (нужны заполненные embedding).
     """
-    entries = search_knowledge_base(query=q, limit=limit)
+    entries = search_knowledge_base(query=q, limit=limit, use_vector=use_vector)
     return KnowledgeBaseSearchResponse(
         query=q,
         count=len(entries),
         entries=[KnowledgeBaseEntry(**e) for e in entries],
     )
+
+
+@app.post("/kb/refresh-embeddings")
+def api_kb_refresh_embeddings():
+    """
+    Заполняет колонку embedding для всех записей knowledge_base, где она NULL.
+    Требуются HF_TOKEN и EMBEDDING_MODEL в .env. Долго при большом объёме.
+    """
+    updated, errors = fill_knowledge_base_embeddings()
+    return {"ok": True, "updated": updated, "errors": errors}
 
 
 def _build_kb_context(entries: list[dict]) -> str:
@@ -267,7 +276,7 @@ def api_kb_ask(req: KbAskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="question не может быть пустым")
 
-    entries = search_knowledge_base(query=question, limit=req.limit)
+    entries = search_knowledge_base(query=question, limit=req.limit, use_vector=req.use_vector)
     source_ids = [e["id"] for e in entries]
 
     if not entries:

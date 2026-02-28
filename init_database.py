@@ -139,24 +139,40 @@ def _seed_kb_from_xlsx(conn: PgConnection) -> None:
         """)
         cols = {r[0] for r in cur.fetchall()}
         has_keywords = "keywords" in cols
+        has_embedding = "embedding" in cols
 
-        if has_keywords:
-            for title, content, short, tags_list, cat in rows:
+        def do_insert(row: tuple) -> None:
+            t, c, s, tags, cat = row
+            if has_embedding and has_keywords:
+                cur.execute(
+                    "INSERT INTO knowledge_base (title, content, short_answer, tags, category, keywords, embedding) VALUES (%s, %s, %s, %s, %s, %s, NULL)",
+                    (t, c, s, tags, cat or None, tags),
+                )
+            elif has_embedding:
+                cur.execute(
+                    "INSERT INTO knowledge_base (title, content, short_answer, tags, category, embedding) VALUES (%s, %s, %s, %s, %s, NULL)",
+                    (t, c, s, tags, cat or None),
+                )
+            elif has_keywords:
                 cur.execute(
                     "INSERT INTO knowledge_base (title, content, short_answer, tags, category, keywords) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (title, content, short, tags_list, cat or None, tags_list),
+                    (t, c, s, tags, cat or None, tags),
                 )
-        else:
-            for title, content, short, tags_list, cat in rows:
+            else:
                 cur.execute(
                     "INSERT INTO knowledge_base (title, content, short_answer, tags, category) VALUES (%s, %s, %s, %s, %s)",
-                    (title, content, short, tags_list, cat or None),
+                    (t, c, s, tags, cat or None),
                 )
+
+        for row in rows:
+            do_insert(row)
         cur.execute("SELECT COUNT(*) FROM knowledge_base")
         total = cur.fetchone()[0]
     print(f"Загружено записей из kb_test.xlsx: {len(rows)}")
     print(f"Всего записей в knowledge_base: {total}")
     print("В колонке tags сохранены шаблонные вопросы (примеры запросов, приводящих к этой теме).")
+    if has_embedding:
+        print("Колонка embedding оставлена NULL — заполните через POST /kb/refresh-embeddings или скрипт.")
 
 
 def exec_many(conn: PgConnection, statements: Iterable[str], title: str) -> None:
@@ -243,11 +259,22 @@ def create_schema(
                 "Удаление старых таблиц",
             )
 
-        # Расширения
+        # Расширения: pg_trgm всегда, vector (pgvector) — опционально
+        vector_available = False
         with conn.cursor() as cur:
             print("\n== Расширения ==")
             print("[1] CREATE EXTENSION IF NOT EXISTS pg_trgm ...")
             cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+            print("[2] CREATE EXTENSION IF NOT EXISTS vector ...")
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                vector_available = True
+                print("OK (pgvector)")
+            except Exception as e:
+                if "vector" in str(e).lower():
+                    print("(пропущено: pgvector не установлен — колонка embedding не будет создана)")
+                else:
+                    raise
 
         # Если таблица tickets уже создана (например backend/db.py) без колонок tags/category/search_vector —
         # добавляем их до создания индексов (только если таблица уже есть).
@@ -311,6 +338,13 @@ def create_schema(
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_kb_search ON knowledge_base USING GIN (search_vector);")
                 except Exception as e:
                     print("(search_vector для knowledge_base:", e, ")")
+                if vector_available:
+                    try:
+                        cur.execute(
+                            "ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS embedding vector(384);"
+                        )
+                    except Exception:
+                        pass
 
         schema_statements = [
             """
@@ -382,7 +416,8 @@ def create_schema(
             "CREATE INDEX IF NOT EXISTS idx_email_log_message_id ON email_log(message_id);",
             "CREATE INDEX IF NOT EXISTS idx_email_log_direction ON email_log(direction);",
             "CREATE INDEX IF NOT EXISTS idx_email_log_created ON email_log(created_at DESC);",
-            """
+            (
+                """
             CREATE TABLE IF NOT EXISTS knowledge_base (
                 id SERIAL PRIMARY KEY,
                 title VARCHAR(500) NOT NULL,
@@ -390,15 +425,17 @@ def create_schema(
                 short_answer TEXT,
                 tags TEXT[],
                 category VARCHAR(100),
-                keywords TEXT[],
+                """
+                + ("embedding vector(384),\n                " if vector_available else "")
+                + """keywords TEXT[],
                 usage_count INTEGER DEFAULT 0,
                 success_rate FLOAT DEFAULT 1.0,
                 is_active BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 search_vector tsvector GENERATED ALWAYS AS (
-                    setweight(to_tsvector('simple', coalesce(title,'')), 'A') ||
-                    setweight(to_tsvector('simple', coalesce(content,'')), 'B')
+                    setweight(to_tsvector('russian', coalesce(title,'')), 'A') ||
+                    setweight(to_tsvector('russian', coalesce(content,'')), 'B')
                 ) STORED
             );
             """,
@@ -425,6 +462,18 @@ def create_schema(
         ]
 
         exec_many(conn, schema_statements, "Создание таблиц и индексов")
+
+        # Индекс для векторного поиска (семантика)
+        if vector_available:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_kb_embedding ON knowledge_base "
+                        "USING ivfflat (embedding vector_cosine_ops) WITH (lists = 1);"
+                    )
+                    print("Индекс idx_kb_embedding создан (при заполнении БЗ пересоздайте с lists ≈ sqrt(rows)).")
+                except Exception as e:
+                    print("(idx_kb_embedding:", e, ")")
 
         # Добавить колонки, если таблица создана старым скриптом без них
         with conn.cursor() as cur:
