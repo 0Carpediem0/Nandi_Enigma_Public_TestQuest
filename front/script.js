@@ -168,8 +168,74 @@ function setupPopup() {
   });
 }
 
+function setupLoginPopup() {
+  const openButton = document.getElementById('open_pop_up');
+  const popup = document.querySelector('.pop_up');
+  const saveButton = document.querySelector('.button_save');
+  const demoAccessText = document.getElementById('demoAccessText');
+  
+  if (!popup) return;
+  
+  const closePopup = () => {
+    popup.classList.remove('is-open');
+    document.body.classList.remove('modal-open');
+    if (saveButton) {
+      saveButton.disabled = false;
+    }
+    // Скрываем "демодоступ" когда попап закрыт
+    if (demoAccessText) {
+      demoAccessText.closest('.demo_access_container').style.display = 'none';
+    }
+  };
+  
+  const openPopup = () => {
+    popup.classList.add('is-open');
+    document.body.classList.add('modal-open');
+    if (saveButton) {
+      saveButton.disabled = true;
+    }
+    if (demoAccessText) {
+      demoAccessText.closest('.demo_access_container').style.display = 'flex';
+    }
+  };
+  
+  if (openButton) {
+    openButton.addEventListener('click', (e) => {
+      e.preventDefault();
+      openPopup();
+    });
+  }
+
+  if (demoAccessText) {
+    demoAccessText.addEventListener('click', (e) => {
+      e.preventDefault();
+      closePopup();
+    });
+  }
+
+  const loginButton = document.querySelector('.button_login');
+  const loginForm = document.querySelector('.pop_up_form');
+  
+  if (loginForm) {
+    loginForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      closePopup();
+    });
+  }
+  
+  if (loginButton) {
+    loginButton.addEventListener('click', (e) => {
+      e.preventDefault();
+      closePopup();
+    });
+  }
+
+  openPopup();
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   setupPopup();
+  setupLoginPopup();
   fetchTickets();
 });
 
