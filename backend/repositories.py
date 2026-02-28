@@ -253,20 +253,23 @@ def search_knowledge_base(
                 ]
                 words = words[:10]
                 if words:
-                    or_parts = " | ".join(w for w in words)
+                    # OR по каждому слову через plainto_tsquery (надёжнее, чем to_tsquery с "a | b")
+                    or_ts = " | ".join(
+                        "plainto_tsquery('russian', %s)" for _ in words
+                    )
                     try:
                         cur.execute(
-                            """
+                            f"""
                             SELECT
                                 id, title, content, short_answer, category,
-                                ts_rank(search_vector, to_tsquery('russian', %s)) AS rank
+                                1.0 AS rank
                             FROM knowledge_base
                             WHERE is_active = TRUE
-                              AND search_vector @@ to_tsquery('russian', %s)
-                            ORDER BY rank DESC
+                              AND search_vector @@ ({or_ts})
+                            ORDER BY id
                             LIMIT %s
                             """,
-                            (or_parts, or_parts, limit),
+                            (*words, limit),
                         )
                         rows = cur.fetchall()
                     except Exception:
@@ -286,6 +289,25 @@ def search_knowledge_base(
                     rows = cur.fetchall()
                 except Exception:
                     rows = []
+            if not rows and words:
+                for w in words:
+                    try:
+                        like_pat = f"%{w.replace('%', '\\%').replace('_', '\\_')}%"
+                        cur.execute(
+                            """
+                            SELECT id, title, content, short_answer, category, 1.0 AS rank
+                            FROM knowledge_base
+                            WHERE is_active = TRUE
+                              AND (title ILIKE %s OR content ILIKE %s)
+                            LIMIT %s
+                            """,
+                            (like_pat, like_pat, limit),
+                        )
+                        rows = cur.fetchall()
+                        if rows:
+                            break
+                    except Exception:
+                        continue
     return [_kb_row_to_dict(r) for r in rows]
 
 
