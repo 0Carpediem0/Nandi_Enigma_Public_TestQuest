@@ -7,11 +7,16 @@ import csv
 import io
 import logging
 import os
+import re
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
+from ai_config import AIConfig
+from ai_embedding import text_to_vector_384
+from ai_pipeline import run_ai_pipeline
 from db import init_db
 from email_service import check_connection, fetch_recent_emails, fetch_recent_emails_sent, send_email
 from repositories import (
@@ -20,11 +25,14 @@ from repositories import (
     create_or_update_ticket_from_email,
     get_ticket,
     list_tickets,
+    log_ai_run,
     mark_ticket_sent,
     set_ai_result,
     update_ticket,
 )
 from schemas import (
+    ProcessBatchEmailsRequest,
+    ProcessBatchEmailsResponse,
     ProcessLatestEmailRequest,
     ProcessLatestEmailResponse,
     ReplyTicketRequest,
@@ -39,8 +47,8 @@ _env_dir = Path(__file__).resolve().parent
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(_env_dir / ".env")
-    load_dotenv()
+    load_dotenv(_env_dir / ".env", override=True)
+    load_dotenv(override=True)
 except ImportError:
     pass
 
@@ -62,57 +70,6 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-def startup_event():
-    logger.info("Initializing database schema")
-    init_db()
-    logger.info("Database schema initialized")
-
-
-def _run_ai_stub(email_item: dict) -> dict:
-    subject = str(email_item.get("subject", "")).strip()
-    from_addr = str(email_item.get("from_addr", "")).strip()
-    body_preview = str(email_item.get("body_preview", "")).strip()
-    text = f"{subject} {body_preview}".lower()
-
-    if any(word in text for word in ("не работает", "ошибка", "авар", "срочно", "слом")):
-        priority = "Высокий"
-        category = "Инцидент / Неисправность"
-        confidence = 0.84
-        tone = "Негативный"
-        needs_attention = True
-    elif any(word in text for word in ("как", "инструкция", "подключ", "настрой")):
-        priority = "Средний"
-        category = "Консультация / Настройка"
-        confidence = 0.78
-        tone = "Нейтральный"
-        needs_attention = False
-    else:
-        priority = "Низкий"
-        category = "Общий запрос"
-        confidence = 0.66
-        tone = "Нейтральный"
-        needs_attention = False
-
-    draft_answer = (
-        "Здравствуйте! Получили ваше обращение. "
-        "Проверьте, пожалуйста, модель устройства и серийный номер в карточке оборудования. "
-        "Если проблема останется, ответьте на это письмо — подключим оператора."
-    )
-
-    return {
-        "from_addr": from_addr or "unknown",
-        "subject": subject or "(без темы)",
-        "body_preview": body_preview or "(пустое письмо)",
-        "priority": priority,
-        "category": category,
-        "tone": tone,
-        "confidence": confidence,
-        "needs_attention": needs_attention,
-        "draft_answer": draft_answer,
-    }
-
-
 def _ingest_single_email(email_item: dict) -> int:
     ticket_id, created = create_or_update_ticket_from_email(email_item)
     create_email_log(
@@ -129,11 +86,56 @@ def _ingest_single_email(email_item: dict) -> int:
     return ticket_id
 
 
+def _extract_keywords(text: str, limit: int = 8) -> list[str]:
+    words = re.findall(r"[a-zA-Zа-яА-Я0-9]{4,}", text.lower())
+    deduped = []
+    seen = set()
+    for word in words:
+        if word in seen:
+            continue
+        seen.add(word)
+        deduped.append(word)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _process_email_to_ticket(email_item: dict) -> tuple[int, dict]:
+    ticket_id = _ingest_single_email(email_item)
+    ai_result = run_ai_pipeline(email_item)
+    set_ai_result(ticket_id, ai_result)
+    log_ai_run(
+        ticket_id=ticket_id,
+        payload={
+            "pipeline_version": ai_result.get("pipeline_version"),
+            "analyzer_model": ai_result.get("analyzer_model"),
+            "generator_model": ai_result.get("generator_model"),
+            "retriever_top_k": len(ai_result.get("sources", [])),
+            "total_latency_ms": ai_result.get("timings_ms", {}).get("total_ms"),
+            "analyzer_latency_ms": ai_result.get("timings_ms", {}).get("analyzer_ms"),
+            "retrieval_latency_ms": ai_result.get("timings_ms", {}).get("retrieval_ms"),
+            "generator_latency_ms": ai_result.get("timings_ms", {}).get("generator_ms"),
+            "guardrails_latency_ms": ai_result.get("timings_ms", {}).get("guardrails_ms"),
+            "fallback_used": ai_result.get("fallback_used", False),
+            "success": True,
+            "error_text": None,
+        },
+    )
+    return ticket_id, ai_result
+
+
 # --- Health and email endpoints ---
 @app.get("/health")
 def health():
     checks = check_connection()
     checks["db"] = "ok"
+    checks["pipeline"] = {
+        "version": AIConfig.PIPELINE_VERSION,
+        "bert_enabled": AIConfig.BERT_ENABLED,
+        "rag_enabled": AIConfig.RAG_ENABLED,
+        "qwen_enabled": AIConfig.QWEN_ENABLED,
+        "auto_send_enabled": AIConfig.AUTO_SEND_ENABLED,
+    }
     return checks
 
 
@@ -231,6 +233,8 @@ def api_save_ticket_to_kb(ticket_id: int, req: SaveToKbRequest):
 
     title = req.title or f"Кейс #{ticket_id}: {ticket.get('subject') or 'без темы'}"
     content = req.content or f"Вопрос: {ticket.get('question')}\n\nОтвет: {ticket.get('answer') or ticket.get('ai_response')}"
+    keywords = _extract_keywords(f"{title} {content}")
+    embedding = text_to_vector_384(f"{title}\n{content}")
     kb_id = create_kb_entry(
         ticket_id=ticket_id,
         title=title,
@@ -238,6 +242,8 @@ def api_save_ticket_to_kb(ticket_id: int, req: SaveToKbRequest):
         short_answer=req.short_answer or ticket.get("answer") or ticket.get("ai_response"),
         category=req.category or ticket.get("category"),
         tags=req.tags or [],
+        keywords=keywords,
+        embedding=embedding,
     )
     logger.info("Ticket %s saved to KB id=%s", ticket_id, kb_id)
     return {"ok": True, "ticket_id": ticket_id, "kb_id": kb_id}
@@ -281,42 +287,34 @@ def api_export_tickets(status: str | None = None):
     )
 
 
-# --- Existing MVP endpoint expanded with DB ---
-@app.post("/mvp/process-latest", response_model=ProcessLatestEmailResponse)
-def api_mvp_process_latest(req: ProcessLatestEmailRequest):
-    operator_email = req.operator_email or os.getenv("OPERATOR_EMAIL")
-    if not operator_email:
-        raise HTTPException(
-            status_code=400,
-            detail="Operator email is not set. Pass operator_email in request or set OPERATOR_EMAIL in env.",
-        )
-
-    emails = fetch_recent_emails(limit=1, mailbox=req.mailbox)
+# --- MVP: один цикл «забрать последнее письмо → AI → отправить оператору» ---
+def _do_mvp_process_latest(operator_email: str, mailbox: str = "INBOX") -> dict | None:
+    """Забирает последнее письмо, прогоняет через AI, шлёт черновик оператору. Возвращает None если писем нет или ошибка."""
+    emails = fetch_recent_emails(limit=1, mailbox=mailbox)
     if not emails:
-        raise HTTPException(status_code=404, detail="No emails found in selected mailbox.")
+        return None
     if len(emails) == 1 and "error" in emails[0]:
-        raise HTTPException(status_code=400, detail=f"IMAP error: {emails[0]['error']}")
-
+        logger.warning("MVP cycle: IMAP error %s", emails[0].get("error"))
+        return None
     latest_email = emails[0]
-    ticket_id = _ingest_single_email(latest_email)
-    ai_result = _run_ai_stub(latest_email)
-    set_ai_result(ticket_id, ai_result)
-
-    operator_subject = f"[MVP][AI-STUB] {ai_result['subject']}"
+    ticket_id, ai_result = _process_email_to_ticket(latest_email)
+    operator_subject = f"[MVP][AI] {ai_result['subject']}"
     operator_body = (
         f"Ticket ID: {ticket_id}\n"
         "MVP-обработка входящего письма\n\n"
         f"От: {ai_result['from_addr']}\n"
         f"Тема: {ai_result['subject']}\n"
-        f"Категория (stub): {ai_result['category']}\n"
-        f"Приоритет (stub): {ai_result['priority']}\n"
-        f"Уверенность (stub): {ai_result['confidence']}\n\n"
+        f"Категория: {ai_result['category']}\n"
+        f"Приоритет: {ai_result['priority']}\n"
+        f"Уверенность: {ai_result['confidence']}\n"
+        f"Требуется внимание оператора: {ai_result['needs_attention']}\n"
+        f"Автоотправка разрешена: {ai_result['auto_send_allowed']}\n"
+        f"Причина автоотправки: {ai_result.get('auto_send_reason') or '-'}\n\n"
         "Краткое содержимое письма:\n"
         f"{ai_result['body_preview']}\n\n"
-        "Черновик ответа от AI-заглушки:\n"
+        "Черновик ответа от AI:\n"
         f"{ai_result['draft_answer']}\n"
     )
-
     send_result = send_email(operator_email, operator_subject, operator_body)
     create_email_log(
         ticket_id=ticket_id,
@@ -330,13 +328,62 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         send_status="ok" if send_result.get("ok") else "error",
         error_text=send_result.get("error"),
     )
+    return {
+        "ticket_id": ticket_id,
+        "ai_result": ai_result,
+        "send_ok": send_result.get("ok"),
+        "operator_email": operator_email,
+    }
 
-    if not send_result.get("ok"):
+
+def _poll_email_worker():
+    """Фоновый поток: каждые N секунд забирает последнее письмо и обрабатывает с AI."""
+    import time
+    interval = int(os.getenv("POLL_EMAIL_EVERY_SEC", "0"))
+    if interval <= 0:
+        return
+    operator_email = os.getenv("OPERATOR_EMAIL")
+    if not operator_email:
+        logger.warning("POLL_EMAIL_EVERY_SEC задан, но OPERATOR_EMAIL пуст — опрос почты отключён")
+        return
+    logger.info("Запуск фонового опроса почты каждые %s с, письма оператору: %s", interval, operator_email)
+    while True:
+        time.sleep(interval)
+        try:
+            result = _do_mvp_process_latest(operator_email, "INBOX")
+            if result:
+                logger.info("Опрос: обработан ticket_id=%s, отправлено оператору: %s", result["ticket_id"], result["operator_email"])
+        except Exception as e:
+            logger.exception("Опрос почты (ошибка): %s", e)
+
+
+@app.on_event("startup")
+def startup_event():
+    logger.info("Initializing database schema")
+    init_db()
+    logger.info("Database schema initialized")
+    poll_sec = int(os.getenv("POLL_EMAIL_EVERY_SEC", "0"))
+    if poll_sec > 0:
+        import threading
+        threading.Thread(target=_poll_email_worker, daemon=True).start()
+
+
+@app.post("/mvp/process-latest", response_model=ProcessLatestEmailResponse)
+def api_mvp_process_latest(req: ProcessLatestEmailRequest):
+    operator_email = req.operator_email or os.getenv("OPERATOR_EMAIL")
+    if not operator_email:
         raise HTTPException(
             status_code=400,
-            detail=f"SMTP error: {send_result.get('error', 'unknown send error')}",
+            detail="Operator email is not set. Pass operator_email in request or set OPERATOR_EMAIL in env.",
         )
-
+    result = _do_mvp_process_latest(operator_email, req.mailbox)
+    if result is None:
+        raise HTTPException(status_code=404, detail="No emails found in selected mailbox.")
+    ai_result = result["ai_result"]
+    ticket_id = result["ticket_id"]
+    send_ok = result["send_ok"]
+    if not send_ok:
+        raise HTTPException(status_code=400, detail="SMTP error when sending to operator.")
     logger.info("MVP processed ticket_id=%s and sent to operator=%s", ticket_id, operator_email)
     return ProcessLatestEmailResponse(
         ok=True,
@@ -345,8 +392,73 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         operator_email=operator_email,
         ai_decision=f"{ai_result['category']} / {ai_result['priority']}",
         ai_draft_response=ai_result["draft_answer"],
-        sent_via_port=send_result.get("port"),
+        ai_confidence=ai_result.get("confidence"),
+        ai_category=ai_result.get("category"),
+        ai_priority=ai_result.get("priority"),
+        needs_attention=bool(ai_result.get("needs_attention")),
+        auto_send_allowed=bool(ai_result.get("auto_send_allowed")),
+        auto_send_reason=ai_result.get("auto_send_reason"),
+        ai_sources=ai_result.get("sources", []),
+        pipeline_version=ai_result.get("pipeline_version"),
+        timings_ms=ai_result.get("timings_ms", {}),
+        sent_via_port=None,
     )
+
+
+@app.post("/mvp/process-batch", response_model=ProcessBatchEmailsResponse)
+def api_mvp_process_batch(req: ProcessBatchEmailsRequest):
+    operator_email = req.operator_email or os.getenv("OPERATOR_EMAIL")
+    if req.notify_operator and not operator_email:
+        raise HTTPException(
+            status_code=400,
+            detail="Operator email is not set. Pass operator_email in request or set OPERATOR_EMAIL in env.",
+        )
+
+    emails = fetch_recent_emails(limit=req.limit, mailbox=req.mailbox)
+    if not emails:
+        return ProcessBatchEmailsResponse(ok=True, processed_count=0, ticket_ids=[])
+    if len(emails) == 1 and "error" in emails[0]:
+        raise HTTPException(status_code=400, detail=f"IMAP error: {emails[0]['error']}")
+
+    processed_ticket_ids = []
+    failures = []
+    for email_item in emails:
+        try:
+            ticket_id, _ = _process_email_to_ticket(email_item)
+            processed_ticket_ids.append(ticket_id)
+        except Exception as exc:
+            failures.append(str(exc))
+
+    digest_sent = False
+    if req.notify_operator and operator_email:
+        digest_subject = f"[MVP][AI-BATCH] processed={len(processed_ticket_ids)} failed={len(failures)}"
+        digest_body = (
+            "Результат batch-обработки писем:\n"
+            f"- mailbox: {req.mailbox}\n"
+            f"- processed: {len(processed_ticket_ids)}\n"
+            f"- failed: {len(failures)}\n"
+            f"- ticket_ids: {processed_ticket_ids}\n"
+        )
+        send_result = send_email(operator_email, digest_subject, digest_body)
+        digest_sent = bool(send_result.get("ok"))
+
+    return ProcessBatchEmailsResponse(
+        ok=True,
+        processed_count=len(processed_ticket_ids),
+        ticket_ids=processed_ticket_ids,
+        failed_count=len(failures),
+        operator_email=operator_email,
+        digest_sent=digest_sent,
+    )
+
+
+# Раздача фронта (index.html, operator.html и т.д.)
+_static_dir = Path(__file__).resolve().parent.parent / "front"
+if not _static_dir.is_dir():
+    _static_dir = Path(__file__).resolve().parent / "static"
+if _static_dir.is_dir():
+    app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="static")
+    logger.info("Serving frontend from %s", _static_dir)
 
 
 if __name__ == "__main__":

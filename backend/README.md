@@ -19,7 +19,8 @@
 | POST | `/tickets/{id}/reply` | Отправка финального ответа клиенту |
 | POST | `/tickets/{id}/save-to-kb` | Сохранение кейса в базу знаний |
 | GET | `/tickets/export` | Экспорт тикетов в CSV |
-| POST | `/mvp/process-latest` | MVP-конвейер: взять последнее письмо -> AI-заглушка -> отправить оператору |
+| POST | `/mvp/process-latest` | AI-конвейер: взять последнее письмо -> BERT-анализ -> RAG поиск -> генерация черновика -> отправить оператору |
+| POST | `/mvp/process-batch` | AI batch-конвейер: обработка нескольких последних писем за один вызов |
 
 ### Пример вызова от агента
 
@@ -81,6 +82,17 @@ docker compose up --build
 2. `GET /tickets` — убедиться, что тикеты есть в UI-формате.
 3. `POST /tickets/{id}/reply` — отправить ответ клиенту.
 4. `POST /tickets/{id}/save-to-kb` — сохранить кейс в `knowledge_base`.
+
+## AI-конвейер (внутренний)
+
+- `ai_pipeline.run_ai_pipeline(email_item)` — оркестрация этапов AI.
+- `ai_analyzer.analyze_email(...)` — классификация (категория/приоритет/тон/уверенность), пытается local BERT inference.
+- `ai_retriever.retrieve_context(...)` — гибридный поиск по KB (ILIKE + FTS).
+- `ai_generator.generate_draft(...)` — генерация черновика ответа, пытается local Qwen inference.
+- `ai_guardrails.apply_guardrails(...)` — fail-safe правила и решение по auto-send.
+- `ai_embedding.text_to_vector_384(...)` — векторизация KB-записей под pgvector (local BERT -> fallback).
+
+Feature flags в `.env`: `BERT_ENABLED`, `RAG_ENABLED`, `QWEN_ENABLED`, `AUTO_SEND_ENABLED`.
 
 ## Модуль email_service (внутренний)
 
