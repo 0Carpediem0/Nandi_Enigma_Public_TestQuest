@@ -7,11 +7,15 @@ import csv
 import io
 import logging
 import os
+import re
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from ai_config import AIConfig
+from ai_embedding import text_to_vector_384
+from ai_pipeline import run_ai_pipeline
 from db import init_db
 from email_service import check_connection, fetch_recent_emails, fetch_recent_emails_sent, send_email
 from repositories import (
@@ -20,11 +24,14 @@ from repositories import (
     create_or_update_ticket_from_email,
     get_ticket,
     list_tickets,
+    log_ai_run,
     mark_ticket_sent,
     set_ai_result,
     update_ticket,
 )
 from schemas import (
+    ProcessBatchEmailsRequest,
+    ProcessBatchEmailsResponse,
     ProcessLatestEmailRequest,
     ProcessLatestEmailResponse,
     ReplyTicketRequest,
@@ -69,50 +76,6 @@ def startup_event():
     logger.info("Database schema initialized")
 
 
-def _run_ai_stub(email_item: dict) -> dict:
-    subject = str(email_item.get("subject", "")).strip()
-    from_addr = str(email_item.get("from_addr", "")).strip()
-    body_preview = str(email_item.get("body_preview", "")).strip()
-    text = f"{subject} {body_preview}".lower()
-
-    if any(word in text for word in ("не работает", "ошибка", "авар", "срочно", "слом")):
-        priority = "Высокий"
-        category = "Инцидент / Неисправность"
-        confidence = 0.84
-        tone = "Негативный"
-        needs_attention = True
-    elif any(word in text for word in ("как", "инструкция", "подключ", "настрой")):
-        priority = "Средний"
-        category = "Консультация / Настройка"
-        confidence = 0.78
-        tone = "Нейтральный"
-        needs_attention = False
-    else:
-        priority = "Низкий"
-        category = "Общий запрос"
-        confidence = 0.66
-        tone = "Нейтральный"
-        needs_attention = False
-
-    draft_answer = (
-        "Здравствуйте! Получили ваше обращение. "
-        "Проверьте, пожалуйста, модель устройства и серийный номер в карточке оборудования. "
-        "Если проблема останется, ответьте на это письмо — подключим оператора."
-    )
-
-    return {
-        "from_addr": from_addr or "unknown",
-        "subject": subject or "(без темы)",
-        "body_preview": body_preview or "(пустое письмо)",
-        "priority": priority,
-        "category": category,
-        "tone": tone,
-        "confidence": confidence,
-        "needs_attention": needs_attention,
-        "draft_answer": draft_answer,
-    }
-
-
 def _ingest_single_email(email_item: dict) -> int:
     ticket_id, created = create_or_update_ticket_from_email(email_item)
     create_email_log(
@@ -129,11 +92,56 @@ def _ingest_single_email(email_item: dict) -> int:
     return ticket_id
 
 
+def _extract_keywords(text: str, limit: int = 8) -> list[str]:
+    words = re.findall(r"[a-zA-Zа-яА-Я0-9]{4,}", text.lower())
+    deduped = []
+    seen = set()
+    for word in words:
+        if word in seen:
+            continue
+        seen.add(word)
+        deduped.append(word)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _process_email_to_ticket(email_item: dict) -> tuple[int, dict]:
+    ticket_id = _ingest_single_email(email_item)
+    ai_result = run_ai_pipeline(email_item)
+    set_ai_result(ticket_id, ai_result)
+    log_ai_run(
+        ticket_id=ticket_id,
+        payload={
+            "pipeline_version": ai_result.get("pipeline_version"),
+            "analyzer_model": ai_result.get("analyzer_model"),
+            "generator_model": ai_result.get("generator_model"),
+            "retriever_top_k": len(ai_result.get("sources", [])),
+            "total_latency_ms": ai_result.get("timings_ms", {}).get("total_ms"),
+            "analyzer_latency_ms": ai_result.get("timings_ms", {}).get("analyzer_ms"),
+            "retrieval_latency_ms": ai_result.get("timings_ms", {}).get("retrieval_ms"),
+            "generator_latency_ms": ai_result.get("timings_ms", {}).get("generator_ms"),
+            "guardrails_latency_ms": ai_result.get("timings_ms", {}).get("guardrails_ms"),
+            "fallback_used": ai_result.get("fallback_used", False),
+            "success": True,
+            "error_text": None,
+        },
+    )
+    return ticket_id, ai_result
+
+
 # --- Health and email endpoints ---
 @app.get("/health")
 def health():
     checks = check_connection()
     checks["db"] = "ok"
+    checks["pipeline"] = {
+        "version": AIConfig.PIPELINE_VERSION,
+        "bert_enabled": AIConfig.BERT_ENABLED,
+        "rag_enabled": AIConfig.RAG_ENABLED,
+        "qwen_enabled": AIConfig.QWEN_ENABLED,
+        "auto_send_enabled": AIConfig.AUTO_SEND_ENABLED,
+    }
     return checks
 
 
@@ -231,6 +239,8 @@ def api_save_ticket_to_kb(ticket_id: int, req: SaveToKbRequest):
 
     title = req.title or f"Кейс #{ticket_id}: {ticket.get('subject') or 'без темы'}"
     content = req.content or f"Вопрос: {ticket.get('question')}\n\nОтвет: {ticket.get('answer') or ticket.get('ai_response')}"
+    keywords = _extract_keywords(f"{title} {content}")
+    embedding = text_to_vector_384(f"{title}\n{content}")
     kb_id = create_kb_entry(
         ticket_id=ticket_id,
         title=title,
@@ -238,6 +248,8 @@ def api_save_ticket_to_kb(ticket_id: int, req: SaveToKbRequest):
         short_answer=req.short_answer or ticket.get("answer") or ticket.get("ai_response"),
         category=req.category or ticket.get("category"),
         tags=req.tags or [],
+        keywords=keywords,
+        embedding=embedding,
     )
     logger.info("Ticket %s saved to KB id=%s", ticket_id, kb_id)
     return {"ok": True, "ticket_id": ticket_id, "kb_id": kb_id}
@@ -298,22 +310,23 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         raise HTTPException(status_code=400, detail=f"IMAP error: {emails[0]['error']}")
 
     latest_email = emails[0]
-    ticket_id = _ingest_single_email(latest_email)
-    ai_result = _run_ai_stub(latest_email)
-    set_ai_result(ticket_id, ai_result)
+    ticket_id, ai_result = _process_email_to_ticket(latest_email)
 
-    operator_subject = f"[MVP][AI-STUB] {ai_result['subject']}"
+    operator_subject = f"[MVP][AI] {ai_result['subject']}"
     operator_body = (
         f"Ticket ID: {ticket_id}\n"
         "MVP-обработка входящего письма\n\n"
         f"От: {ai_result['from_addr']}\n"
         f"Тема: {ai_result['subject']}\n"
-        f"Категория (stub): {ai_result['category']}\n"
-        f"Приоритет (stub): {ai_result['priority']}\n"
-        f"Уверенность (stub): {ai_result['confidence']}\n\n"
+        f"Категория: {ai_result['category']}\n"
+        f"Приоритет: {ai_result['priority']}\n"
+        f"Уверенность: {ai_result['confidence']}\n"
+        f"Требуется внимание оператора: {ai_result['needs_attention']}\n"
+        f"Автоотправка разрешена: {ai_result['auto_send_allowed']}\n"
+        f"Причина автоотправки: {ai_result.get('auto_send_reason') or '-'}\n\n"
         "Краткое содержимое письма:\n"
         f"{ai_result['body_preview']}\n\n"
-        "Черновик ответа от AI-заглушки:\n"
+        "Черновик ответа от AI:\n"
         f"{ai_result['draft_answer']}\n"
     )
 
@@ -345,7 +358,63 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         operator_email=operator_email,
         ai_decision=f"{ai_result['category']} / {ai_result['priority']}",
         ai_draft_response=ai_result["draft_answer"],
+        ai_confidence=ai_result.get("confidence"),
+        ai_category=ai_result.get("category"),
+        ai_priority=ai_result.get("priority"),
+        needs_attention=bool(ai_result.get("needs_attention")),
+        auto_send_allowed=bool(ai_result.get("auto_send_allowed")),
+        auto_send_reason=ai_result.get("auto_send_reason"),
+        ai_sources=ai_result.get("sources", []),
+        pipeline_version=ai_result.get("pipeline_version"),
+        timings_ms=ai_result.get("timings_ms", {}),
         sent_via_port=send_result.get("port"),
+    )
+
+
+@app.post("/mvp/process-batch", response_model=ProcessBatchEmailsResponse)
+def api_mvp_process_batch(req: ProcessBatchEmailsRequest):
+    operator_email = req.operator_email or os.getenv("OPERATOR_EMAIL")
+    if req.notify_operator and not operator_email:
+        raise HTTPException(
+            status_code=400,
+            detail="Operator email is not set. Pass operator_email in request or set OPERATOR_EMAIL in env.",
+        )
+
+    emails = fetch_recent_emails(limit=req.limit, mailbox=req.mailbox)
+    if not emails:
+        return ProcessBatchEmailsResponse(ok=True, processed_count=0, ticket_ids=[])
+    if len(emails) == 1 and "error" in emails[0]:
+        raise HTTPException(status_code=400, detail=f"IMAP error: {emails[0]['error']}")
+
+    processed_ticket_ids = []
+    failures = []
+    for email_item in emails:
+        try:
+            ticket_id, _ = _process_email_to_ticket(email_item)
+            processed_ticket_ids.append(ticket_id)
+        except Exception as exc:
+            failures.append(str(exc))
+
+    digest_sent = False
+    if req.notify_operator and operator_email:
+        digest_subject = f"[MVP][AI-BATCH] processed={len(processed_ticket_ids)} failed={len(failures)}"
+        digest_body = (
+            "Результат batch-обработки писем:\n"
+            f"- mailbox: {req.mailbox}\n"
+            f"- processed: {len(processed_ticket_ids)}\n"
+            f"- failed: {len(failures)}\n"
+            f"- ticket_ids: {processed_ticket_ids}\n"
+        )
+        send_result = send_email(operator_email, digest_subject, digest_body)
+        digest_sent = bool(send_result.get("ok"))
+
+    return ProcessBatchEmailsResponse(
+        ok=True,
+        processed_count=len(processed_ticket_ids),
+        ticket_ids=processed_ticket_ids,
+        failed_count=len(failures),
+        operator_email=operator_email,
+        digest_sent=digest_sent,
     )
 
 

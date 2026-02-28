@@ -34,6 +34,8 @@ def get_connection():
 
 def init_db() -> None:
     statements = [
+        "CREATE EXTENSION IF NOT EXISTS vector;",
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm;",
         """
         CREATE TABLE IF NOT EXISTS operators (
             id SERIAL PRIMARY KEY,
@@ -57,10 +59,17 @@ def init_db() -> None:
             answer TEXT,
             status VARCHAR(50) DEFAULT 'new',
             ai_confidence FLOAT,
+            ai_processing_time_ms INTEGER,
             ai_suggested_answer TEXT,
             ai_category VARCHAR(100),
             ai_priority VARCHAR(50),
             ai_tone VARCHAR(50),
+            ai_model VARCHAR(100),
+            ai_sources JSONB DEFAULT '[]'::jsonb,
+            ai_reasoning_short TEXT,
+            pipeline_version VARCHAR(50),
+            auto_send_allowed BOOLEAN DEFAULT FALSE,
+            auto_send_reason TEXT,
             needs_attention BOOLEAN DEFAULT FALSE,
             is_resolved BOOLEAN DEFAULT FALSE,
             message_id VARCHAR(255) UNIQUE,
@@ -68,12 +77,45 @@ def init_db() -> None:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             processed_at TIMESTAMP,
-            resolved_at TIMESTAMP
+            resolved_at TIMESTAMP,
+            search_vector tsvector GENERATED ALWAYS AS (
+                setweight(to_tsvector('simple', coalesce(question,'')), 'A') ||
+                setweight(to_tsvector('simple', coalesce(answer,'')), 'B')
+            ) STORED
         );
         """,
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ai_processing_time_ms INTEGER;",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ai_model VARCHAR(100);",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ai_sources JSONB DEFAULT '[]'::jsonb;",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ai_reasoning_short TEXT;",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS pipeline_version VARCHAR(50);",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS auto_send_allowed BOOLEAN DEFAULT FALSE;",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS auto_send_reason TEXT;",
+        """
+        ALTER TABLE tickets
+        ADD COLUMN IF NOT EXISTS search_vector tsvector
+        GENERATED ALWAYS AS (
+            setweight(to_tsvector('simple', coalesce(question,'')), 'A') ||
+            setweight(to_tsvector('simple', coalesce(answer,'')), 'B')
+        ) STORED;
+        """,
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS phone VARCHAR(50);",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS location_object VARCHAR(255);",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS serial_numbers VARCHAR(255);",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS device_type VARCHAR(255);",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ai_category VARCHAR(100);",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ai_priority VARCHAR(50);",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ai_tone VARCHAR(50);",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS processed_at TIMESTAMP;",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP;",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS message_id VARCHAR(255);",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS in_reply_to VARCHAR(255);",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_message_id_unique ON tickets(message_id);",
         "CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);",
         "CREATE INDEX IF NOT EXISTS idx_tickets_client_email ON tickets(client_email);",
         "CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_tickets_needs_attention ON tickets(needs_attention);",
+        "CREATE INDEX IF NOT EXISTS idx_tickets_search ON tickets USING GIN (search_vector);",
         """
         CREATE TABLE IF NOT EXISTS email_log (
             id SERIAL PRIMARY KEY,
@@ -90,6 +132,8 @@ def init_db() -> None:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """,
+        "ALTER TABLE email_log ADD COLUMN IF NOT EXISTS send_status VARCHAR(50);",
+        "ALTER TABLE email_log ADD COLUMN IF NOT EXISTS error_text TEXT;",
         "CREATE INDEX IF NOT EXISTS idx_email_log_ticket ON email_log(ticket_id);",
         "CREATE INDEX IF NOT EXISTS idx_email_log_message_id ON email_log(message_id);",
         """
@@ -102,13 +146,54 @@ def init_db() -> None:
             tags TEXT[],
             category VARCHAR(100),
             usage_count INTEGER DEFAULT 0,
+            success_rate FLOAT DEFAULT 1.0,
+            keywords TEXT[],
+            embedding vector(384),
             is_active BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            search_vector tsvector GENERATED ALWAYS AS (
+                setweight(to_tsvector('simple', coalesce(title,'')), 'A') ||
+                setweight(to_tsvector('simple', coalesce(content,'')), 'B')
+            ) STORED
         );
+        """,
+        "ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS success_rate FLOAT DEFAULT 1.0;",
+        "ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS keywords TEXT[];",
+        "ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS embedding vector(384);",
+        "ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS ticket_id INTEGER REFERENCES tickets(id) ON DELETE SET NULL;",
+        """
+        ALTER TABLE knowledge_base
+        ADD COLUMN IF NOT EXISTS search_vector tsvector
+        GENERATED ALWAYS AS (
+            setweight(to_tsvector('simple', coalesce(title,'')), 'A') ||
+            setweight(to_tsvector('simple', coalesce(content,'')), 'B')
+        ) STORED;
         """,
         "CREATE INDEX IF NOT EXISTS idx_kb_category ON knowledge_base(category);",
         "CREATE INDEX IF NOT EXISTS idx_kb_active ON knowledge_base(is_active);",
+        "CREATE INDEX IF NOT EXISTS idx_kb_search ON knowledge_base USING GIN (search_vector);",
+        """
+        CREATE TABLE IF NOT EXISTS ai_run_log (
+            id SERIAL PRIMARY KEY,
+            ticket_id INTEGER REFERENCES tickets(id) ON DELETE CASCADE,
+            pipeline_version VARCHAR(50) NOT NULL,
+            analyzer_model VARCHAR(100),
+            generator_model VARCHAR(100),
+            retriever_top_k INTEGER,
+            total_latency_ms INTEGER,
+            analyzer_latency_ms INTEGER,
+            retrieval_latency_ms INTEGER,
+            generator_latency_ms INTEGER,
+            guardrails_latency_ms INTEGER,
+            fallback_used BOOLEAN DEFAULT FALSE,
+            success BOOLEAN DEFAULT TRUE,
+            error_text TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_ai_run_log_ticket_id ON ai_run_log(ticket_id);",
+        "CREATE INDEX IF NOT EXISTS idx_ai_run_log_created_at ON ai_run_log(created_at DESC);",
     ]
 
     with get_connection() as conn:

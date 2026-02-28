@@ -27,9 +27,15 @@ async function loadTickets() {
     tickets.forEach((ticket) => {
       const option = document.createElement('option');
       option.value = String(ticket.id);
-      option.textContent = `#${ticket.id} | ${ticket.email} | ${ticket.status}`;
+      option.textContent = `#${ticket.id} | ${ticket.email} | ${ticket.status} | conf=${ticket.ai_confidence ?? '-'}`;
       option.dataset.status = ticket.status || 'new';
       option.dataset.ai = ticket.ai_response || '';
+      option.dataset.category = ticket.category || '-';
+      option.dataset.priority = ticket.priority || '-';
+      option.dataset.confidence = String(ticket.ai_confidence ?? '-');
+      option.dataset.needsAttention = String(Boolean(ticket.needs_attention));
+      option.dataset.autoSendAllowed = String(Boolean(ticket.auto_send_allowed));
+      option.dataset.autoSendReason = ticket.auto_send_reason || '-';
       select.appendChild(option);
     });
 
@@ -53,6 +59,16 @@ function hydrateFromSelected() {
   if (!current) return;
   status.value = current.dataset.status || 'new';
   reply.value = current.dataset.ai || '';
+  setStatus(
+    [
+      `AI: ${current.dataset.category || '-'}`,
+      `priority=${current.dataset.priority || '-'}`,
+      `confidence=${current.dataset.confidence || '-'}`,
+      `needs_attention=${current.dataset.needsAttention || '-'}`,
+      `auto_send=${current.dataset.autoSendAllowed || '-'}`,
+      `reason=${current.dataset.autoSendReason || '-'}`,
+    ].join(' | ')
+  );
 }
 
 async function updateTicket() {

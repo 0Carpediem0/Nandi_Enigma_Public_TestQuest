@@ -120,6 +120,13 @@ def create_schema(
                 ai_processing_time INTEGER,
                 ai_suggested_answer TEXT,
                 ai_model VARCHAR(50),
+                ai_tone VARCHAR(50),
+                ai_priority VARCHAR(50),
+                ai_sources JSONB DEFAULT '[]'::jsonb,
+                ai_reasoning_short TEXT,
+                pipeline_version VARCHAR(50),
+                auto_send_allowed BOOLEAN DEFAULT FALSE,
+                auto_send_reason TEXT,
                 tags TEXT[],
                 category VARCHAR(100),
                 operator_id INTEGER REFERENCES operators(id) ON DELETE SET NULL,
@@ -183,11 +190,32 @@ def create_schema(
                 ) STORED
             );
             """,
+            """
+            CREATE TABLE IF NOT EXISTS ai_run_log (
+                id SERIAL PRIMARY KEY,
+                ticket_id INTEGER REFERENCES tickets(id) ON DELETE CASCADE,
+                pipeline_version VARCHAR(50) NOT NULL,
+                analyzer_model VARCHAR(100),
+                generator_model VARCHAR(100),
+                retriever_top_k INTEGER,
+                total_latency_ms INTEGER,
+                analyzer_latency_ms INTEGER,
+                retrieval_latency_ms INTEGER,
+                generator_latency_ms INTEGER,
+                guardrails_latency_ms INTEGER,
+                fallback_used BOOLEAN DEFAULT FALSE,
+                success BOOLEAN DEFAULT TRUE,
+                error_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
             "CREATE INDEX IF NOT EXISTS idx_kb_tags ON knowledge_base USING GIN (tags);",
             "CREATE INDEX IF NOT EXISTS idx_kb_category ON knowledge_base(category);",
             "CREATE INDEX IF NOT EXISTS idx_kb_is_active ON knowledge_base(is_active);",
             "CREATE INDEX IF NOT EXISTS idx_kb_search ON knowledge_base USING GIN (search_vector);",
             "CREATE INDEX IF NOT EXISTS idx_kb_usage ON knowledge_base(usage_count DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_ai_run_log_ticket_id ON ai_run_log(ticket_id);",
+            "CREATE INDEX IF NOT EXISTS idx_ai_run_log_created_at ON ai_run_log(created_at DESC);",
             """
             CREATE TABLE IF NOT EXISTS feedback (
                 id SERIAL PRIMARY KEY,

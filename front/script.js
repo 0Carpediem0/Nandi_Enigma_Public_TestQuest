@@ -39,6 +39,13 @@ function renderTable(tickets) {
     row.dataset.aiResponse = aiResponseText;
     row.dataset.status = String(ticket.status || 'new');
     row.dataset.email = String(ticket.email || '');
+    row.dataset.aiConfidence = String(ticket.ai_confidence ?? '-');
+    row.dataset.aiCategory = String(ticket.category || '-');
+    row.dataset.aiPriority = String(ticket.priority || '-');
+    row.dataset.aiNeedsAttention = String(Boolean(ticket.needs_attention));
+    row.dataset.aiAutoSendAllowed = String(Boolean(ticket.auto_send_allowed));
+    row.dataset.aiAutoSendReason = String(ticket.auto_send_reason || '-');
+    row.dataset.aiSources = JSON.stringify(ticket.ai_sources || []);
 
     row.innerHTML = `
       <td>${formatDate(ticket.date)}</td>
@@ -143,8 +150,21 @@ function setupPopup() {
   };
 
   const openModal = (row) => {
+    const sources = safeParseSources(row.dataset.aiSources);
+    const sourcePreview = sources.length
+      ? sources.map((item) => `#${item.kb_id ?? '-'} ${item.title || '-'}`).join('\n')
+      : '-';
+    const aiMeta = [
+      `Категория: ${row.dataset.aiCategory || '-'}`,
+      `Приоритет: ${row.dataset.aiPriority || '-'}`,
+      `Уверенность: ${row.dataset.aiConfidence || '-'}`,
+      `Требуется оператор: ${row.dataset.aiNeedsAttention || '-'}`,
+      `Auto-send: ${row.dataset.aiAutoSendAllowed || '-'}`,
+      `Причина блокировки auto-send: ${row.dataset.aiAutoSendReason || '-'}`,
+      `Источники KB:\n${sourcePreview}`,
+    ].join('\n');
     questionNode.textContent = row.dataset.question || '-';
-    aiNode.textContent = row.dataset.aiResponse || '-';
+    aiNode.textContent = `${row.dataset.aiResponse || '-'}\n\n---\n${aiMeta}`;
     modal.classList.add('is-open');
     document.body.classList.add('modal-open');
   };
@@ -172,6 +192,15 @@ document.addEventListener('DOMContentLoaded', () => {
   setupPopup();
   fetchTickets();
 });
+
+function safeParseSources(rawValue) {
+  try {
+    const parsed = JSON.parse(rawValue || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    return [];
+  }
+}
 
 function exportTableToExcel() {
   const tbody = document.getElementById('tableBody');
