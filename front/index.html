@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>База знаний - ЭРИС</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="./style.css">
     <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
 </head>
@@ -11,11 +14,31 @@
   <header class="header_eris">
     <img src="./logo.svg" alt="Логотип ЭРИС" class="logo"/>
     <button class="button_save" onclick="exportTableToExcel()" title="Скачать XLSX">
-      <img src="./savebutton.svg" alt="Загрузка файла">
+      <img src="./savebutton.svg" alt="Загрузка файла" class="">
     </button>
     <input type="file" id="fileInput" style="display: none;" />
   </header>
-
+  <div class="button_pop_up">
+    <a href="#" id="open_pop_up"> Начать работу </a>
+  </div>
+  <div class="pop_up">
+    <div class="pop_up_container">
+      <div class="pop_up_body">
+        <h2 class="pop_up_title">Вход в панель оператора</h2>
+        <form action="" class="pop_up_form">
+          <div class="form_field">
+            <label for="login">Логин</label>
+            <input type="text" id="login" name="login" placeholder="">
+          </div>
+          <div class="form_field">
+            <label for="password">Пароль</label>
+            <input type="password" id="password" name="password" placeholder="">
+          </div>
+          <button type="submit" class="button_login">Вход</button>
+        </form>
+      </div>
+    </div>
+  </div>
   <div class="container">
     <table class="data-table">
       <thead>
@@ -32,9 +55,9 @@
           <th>Ответ AI</th>
         </tr>
       </thead>
-      <!-- Важно: добавили id для JS -->
+      <!-- добавили id для JS -->
       <tbody id="tableBody">
-        <!-- Сюда JavaScript вставит строки -->
+        <!-- cюда js вставит строки -->
       </tbody>
     </table>
   </div>
@@ -56,6 +79,10 @@
         </section>
       </div>
     </div>
+  </div>
+
+  <div class="demo_access_container">
+    <span class="demo_access_text" id="demoAccessText">демодоступ</span>
   </div>
 
   <script src="script.js"></script>
