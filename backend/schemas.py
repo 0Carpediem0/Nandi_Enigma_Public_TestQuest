@@ -36,8 +36,36 @@ class ProcessLatestEmailResponse(BaseModel):
     operator_email: str
     ai_decision: str
     ai_draft_response: str
+    ai_confidence: float | None = None
+    ai_category: str | None = None
+    ai_priority: str | None = None
+    needs_attention: bool = False
+    auto_send_allowed: bool = False
+    auto_send_reason: str | None = None
+    ai_sources: list[dict] = Field(default_factory=list)
+    pipeline_version: str | None = None
+    timings_ms: dict = Field(default_factory=dict)
     sent_via_port: int | None = None
     error: str | None = None
+
+
+class ProcessBatchEmailsRequest(BaseModel):
+    mailbox: str = Field("INBOX", description="Папка, из которой берём письма")
+    limit: int = Field(5, ge=1, le=50, description="Сколько последних писем обработать")
+    operator_email: str | None = Field(
+        None,
+        description="Почта оператора. Если не передана, используется OPERATOR_EMAIL из окружения.",
+    )
+    notify_operator: bool = Field(False, description="Отправить оператору краткий digest обработки")
+
+
+class ProcessBatchEmailsResponse(BaseModel):
+    ok: bool
+    processed_count: int
+    ticket_ids: list[int] = Field(default_factory=list)
+    failed_count: int = 0
+    operator_email: str | None = None
+    digest_sent: bool = False
 
 
 class UpdateTicketRequest(BaseModel):

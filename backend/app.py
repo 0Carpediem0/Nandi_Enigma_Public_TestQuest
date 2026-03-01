@@ -14,6 +14,9 @@ from fastapi import Body, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from ai_config import AIConfig
+from ai_embedding import text_to_vector_384
+from ai_pipeline import run_ai_pipeline
 from db import init_db
 from email_service import check_connection, fetch_recent_emails, fetch_recent_emails_sent, send_email
 from repositories import (
@@ -24,6 +27,7 @@ from repositories import (
     get_ticket,
     incoming_email_already_processed,
     list_tickets,
+    log_ai_run,
     mark_ticket_sent,
     search_knowledge_base,
     set_ai_result,
@@ -50,8 +54,8 @@ _env_dir = Path(__file__).resolve().parent
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(_env_dir / ".env")
-    load_dotenv()
+    load_dotenv(_env_dir / ".env", override=True)
+    load_dotenv(override=True)
 except ImportError:
     pass
 
@@ -295,11 +299,56 @@ def _ingest_single_email(email_item: dict) -> int:
     return ticket_id
 
 
+def _extract_keywords(text: str, limit: int = 8) -> list[str]:
+    words = re.findall(r"[a-zA-Zа-яА-Я0-9]{4,}", text.lower())
+    deduped = []
+    seen = set()
+    for word in words:
+        if word in seen:
+            continue
+        seen.add(word)
+        deduped.append(word)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _process_email_to_ticket(email_item: dict) -> tuple[int, dict]:
+    ticket_id = _ingest_single_email(email_item)
+    ai_result = run_ai_pipeline(email_item)
+    set_ai_result(ticket_id, ai_result)
+    log_ai_run(
+        ticket_id=ticket_id,
+        payload={
+            "pipeline_version": ai_result.get("pipeline_version"),
+            "analyzer_model": ai_result.get("analyzer_model"),
+            "generator_model": ai_result.get("generator_model"),
+            "retriever_top_k": len(ai_result.get("sources", [])),
+            "total_latency_ms": ai_result.get("timings_ms", {}).get("total_ms"),
+            "analyzer_latency_ms": ai_result.get("timings_ms", {}).get("analyzer_ms"),
+            "retrieval_latency_ms": ai_result.get("timings_ms", {}).get("retrieval_ms"),
+            "generator_latency_ms": ai_result.get("timings_ms", {}).get("generator_ms"),
+            "guardrails_latency_ms": ai_result.get("timings_ms", {}).get("guardrails_ms"),
+            "fallback_used": ai_result.get("fallback_used", False),
+            "success": True,
+            "error_text": None,
+        },
+    )
+    return ticket_id, ai_result
+
+
 # --- Health and email endpoints ---
 @app.get("/health")
 def health():
     checks = check_connection()
     checks["db"] = "ok"
+    checks["pipeline"] = {
+        "version": AIConfig.PIPELINE_VERSION,
+        "bert_enabled": AIConfig.BERT_ENABLED,
+        "rag_enabled": AIConfig.RAG_ENABLED,
+        "qwen_enabled": AIConfig.QWEN_ENABLED,
+        "auto_send_enabled": AIConfig.AUTO_SEND_ENABLED,
+    }
     return checks
 
 
@@ -491,6 +540,8 @@ def api_save_ticket_to_kb(ticket_id: int, req: SaveToKbRequest):
 
     title = req.title or f"Кейс #{ticket_id}: {ticket.get('subject') or 'без темы'}"
     content = req.content or f"Вопрос: {ticket.get('question')}\n\nОтвет: {ticket.get('answer') or ticket.get('ai_response')}"
+    keywords = _extract_keywords(f"{title} {content}")
+    embedding = text_to_vector_384(f"{title}\n{content}")
     kb_id = create_kb_entry(
         ticket_id=ticket_id,
         title=title,
@@ -498,6 +549,8 @@ def api_save_ticket_to_kb(ticket_id: int, req: SaveToKbRequest):
         short_answer=req.short_answer or ticket.get("answer") or ticket.get("ai_response"),
         category=req.category or ticket.get("category"),
         tags=req.tags or [],
+        keywords=keywords,
+        embedding=embedding,
     )
     logger.info("Ticket %s saved to KB id=%s", ticket_id, kb_id)
     return {"ok": True, "ticket_id": ticket_id, "kb_id": kb_id}
@@ -609,6 +662,12 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         send_status="ok" if send_result.get("ok") else "error",
         error_text=send_result.get("error"),
     )
+    return {
+        "ticket_id": ticket_id,
+        "ai_result": ai_result,
+        "send_ok": send_result.get("ok"),
+        "operator_email": operator_email,
+    }
 
     if not send_result.get("ok"):
         raise HTTPException(status_code=503, detail=STUB_SEND_MSG)
@@ -621,7 +680,16 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         operator_email=operator_email,
         ai_decision=f"{ai_result['category']} / {ai_result['priority']}",
         ai_draft_response=ai_result["draft_answer"],
-        sent_via_port=send_result.get("port"),
+        ai_confidence=ai_result.get("confidence"),
+        ai_category=ai_result.get("category"),
+        ai_priority=ai_result.get("priority"),
+        needs_attention=bool(ai_result.get("needs_attention")),
+        auto_send_allowed=bool(ai_result.get("auto_send_allowed")),
+        auto_send_reason=ai_result.get("auto_send_reason"),
+        ai_sources=ai_result.get("sources", []),
+        pipeline_version=ai_result.get("pipeline_version"),
+        timings_ms=ai_result.get("timings_ms", {}),
+        sent_via_port=None,
     )
 
 

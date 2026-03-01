@@ -33,6 +33,10 @@ def _ticket_to_front(ticket: dict[str, Any]) -> dict[str, Any]:
         "category": ticket.get("ai_category"),
         "priority": ticket.get("ai_priority"),
         "ai_confidence": ticket.get("ai_confidence"),
+        "ai_sources": ticket.get("ai_sources") or [],
+        "pipeline_version": ticket.get("pipeline_version"),
+        "auto_send_allowed": bool(ticket.get("auto_send_allowed")),
+        "auto_send_reason": ticket.get("auto_send_reason"),
     }
 
 
@@ -137,6 +141,13 @@ def set_ai_result(ticket_id: int, ai_result: dict[str, Any]) -> None:
                     ai_priority = %s,
                     ai_tone = %s,
                     ai_confidence = %s,
+                    ai_model = %s,
+                    ai_sources = %s,
+                    ai_reasoning_short = %s,
+                    pipeline_version = %s,
+                    ai_processing_time_ms = %s,
+                    auto_send_allowed = %s,
+                    auto_send_reason = %s,
                     needs_attention = %s,
                     status = 'drafted',
                     processed_at = %s,
@@ -149,6 +160,13 @@ def set_ai_result(ticket_id: int, ai_result: dict[str, Any]) -> None:
                     ai_result.get("priority"),
                     ai_result.get("tone"),
                     ai_result.get("confidence"),
+                    ai_result.get("model"),
+                    ai_result.get("sources", []),
+                    ai_result.get("reasoning_short"),
+                    ai_result.get("pipeline_version"),
+                    ai_result.get("processing_time_ms"),
+                    ai_result.get("auto_send_allowed", False),
+                    ai_result.get("auto_send_reason"),
                     ai_result.get("needs_attention", False),
                     datetime.utcnow(),
                     datetime.utcnow(),
@@ -364,16 +382,18 @@ def create_kb_entry(
     short_answer: str | None,
     category: str | None,
     tags: list[str] | None = None,
+    keywords: list[str] | None = None,
+    embedding: list[float] | None = None,
 ) -> int:
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                INSERT INTO knowledge_base (ticket_id, title, content, short_answer, category, tags)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO knowledge_base (ticket_id, title, content, short_answer, category, tags, keywords, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (ticket_id, title, content, short_answer, category, tags or []),
+                (ticket_id, title, content, short_answer, category, tags or [], keywords or [], embedding),
             )
             row = cur.fetchone()
 
@@ -429,5 +449,77 @@ def create_email_log(
                     direction,
                     send_status,
                     error_text,
+                ),
+            )
+
+
+def search_kb_hybrid(
+    query_text: str,
+    category: str | None = None,
+    top_k: int = 3,
+) -> list[dict[str, Any]]:
+    like_q = f"%{query_text.strip()}%"
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT id, title, content, short_answer, category, tags, usage_count, success_rate
+                    FROM knowledge_base
+                    WHERE is_active = TRUE
+                      AND (%s::text IS NULL OR category = %s)
+                      AND (
+                            title ILIKE %s
+                         OR content ILIKE %s
+                         OR search_vector @@ plainto_tsquery('simple', %s)
+                      )
+                    ORDER BY usage_count DESC, success_rate DESC, created_at DESC
+                    LIMIT %s
+                    """,
+                    (category, category, like_q, like_q, query_text, top_k),
+                )
+                return cur.fetchall()
+            except Exception:
+                # Fallback for instances where search_vector is not present yet.
+                cur.execute(
+                    """
+                    SELECT id, title, content, short_answer, category, tags, usage_count, success_rate
+                    FROM knowledge_base
+                    WHERE is_active = TRUE
+                      AND (%s::text IS NULL OR category = %s)
+                      AND (title ILIKE %s OR content ILIKE %s)
+                    ORDER BY usage_count DESC, success_rate DESC, created_at DESC
+                    LIMIT %s
+                    """,
+                    (category, category, like_q, like_q, top_k),
+                )
+                return cur.fetchall()
+
+
+def log_ai_run(ticket_id: int, payload: dict[str, Any]) -> None:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ai_run_log (
+                    ticket_id, pipeline_version, analyzer_model, generator_model, retriever_top_k,
+                    total_latency_ms, analyzer_latency_ms, retrieval_latency_ms,
+                    generator_latency_ms, guardrails_latency_ms, fallback_used, success, error_text
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    ticket_id,
+                    payload.get("pipeline_version") or "v1",
+                    payload.get("analyzer_model"),
+                    payload.get("generator_model"),
+                    payload.get("retriever_top_k"),
+                    payload.get("total_latency_ms"),
+                    payload.get("analyzer_latency_ms"),
+                    payload.get("retrieval_latency_ms"),
+                    payload.get("generator_latency_ms"),
+                    payload.get("guardrails_latency_ms"),
+                    payload.get("fallback_used", False),
+                    payload.get("success", True),
+                    payload.get("error_text"),
                 ),
             )

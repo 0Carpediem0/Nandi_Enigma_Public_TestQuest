@@ -45,9 +45,15 @@ async function loadTickets() {
     tickets.forEach((ticket) => {
       const option = document.createElement('option');
       option.value = String(ticket.id);
-      option.textContent = `#${ticket.id} | ${ticket.email} | ${ticket.status}`;
+      option.textContent = `#${ticket.id} | ${ticket.email} | ${ticket.status} | conf=${ticket.ai_confidence ?? '-'}`;
       option.dataset.status = ticket.status || 'new';
       option.dataset.ai = ticket.ai_response || '';
+      option.dataset.category = ticket.category || '-';
+      option.dataset.priority = ticket.priority || '-';
+      option.dataset.confidence = String(ticket.ai_confidence ?? '-');
+      option.dataset.needsAttention = String(Boolean(ticket.needs_attention));
+      option.dataset.autoSendAllowed = String(Boolean(ticket.auto_send_allowed));
+      option.dataset.autoSendReason = ticket.auto_send_reason || '-';
       select.appendChild(option);
     });
 
@@ -74,6 +80,16 @@ function hydrateFromSelected() {
   if (!current) return;
   status.value = current.dataset.status || 'new';
   reply.value = current.dataset.ai || '';
+  setStatus(
+    [
+      `AI: ${current.dataset.category || '-'}`,
+      `priority=${current.dataset.priority || '-'}`,
+      `confidence=${current.dataset.confidence || '-'}`,
+      `needs_attention=${current.dataset.needsAttention || '-'}`,
+      `auto_send=${current.dataset.autoSendAllowed || '-'}`,
+      `reason=${current.dataset.autoSendReason || '-'}`,
+    ].join(' | ')
+  );
 }
 
 async function updateTicket() {
@@ -187,6 +203,44 @@ async function processLatestEmail() {
     }
   } finally {
     if (btn) btn.disabled = false;
+  }
+}
+
+async function ingestEmails() {
+  setIngestStatus('Забираю входящие…');
+  setIngestLoading(true);
+  try {
+    const data = await apiFetch(`${API_BASE}/emails/ingest?limit=20&mailbox=INBOX`, { method: 'POST' });
+    setIngestStatus(`Создано тикетов: ${data.ingested_count || 0}`);
+    await loadTickets();
+  } catch (error) {
+    setIngestStatus(`Ошибка: ${error.message}`);
+  } finally {
+    setIngestLoading(false);
+  }
+}
+
+async function processLatestEmail() {
+  const operatorEmail = document.getElementById('operatorEmail')?.value?.trim();
+  setIngestStatus('Обработка последнего письма с помощью ИИ…');
+  setIngestLoading(true);
+  try {
+    const body = operatorEmail
+      ? { mailbox: 'INBOX', operator_email: operatorEmail }
+      : { mailbox: 'INBOX' };
+    const data = await apiFetch(`${API_BASE}/mvp/process-latest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify(body),
+    });
+    setIngestStatus(
+      `Готово. От: ${data.source_from || '-'}, тема: ${data.source_subject || '-'}. Черновик отправлен оператору.`
+    );
+    await loadTickets();
+  } catch (error) {
+    setIngestStatus(`Ошибка: ${error.message}`);
+  } finally {
+    setIngestLoading(false);
   }
 }
 
