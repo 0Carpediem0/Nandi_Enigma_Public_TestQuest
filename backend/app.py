@@ -7,10 +7,10 @@ import csv
 import io
 import logging
 import os
-import re
+import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import Body, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -23,16 +23,23 @@ from repositories import (
     create_email_log,
     create_kb_entry,
     create_or_update_ticket_from_email,
+    fill_knowledge_base_embeddings,
     get_ticket,
+    incoming_email_already_processed,
     list_tickets,
     log_ai_run,
     mark_ticket_sent,
+    search_knowledge_base,
     set_ai_result,
     update_ticket,
 )
+from qwen_service import ask_qwen
 from schemas import (
-    ProcessBatchEmailsRequest,
-    ProcessBatchEmailsResponse,
+    KnowledgeBaseEntry,
+    KnowledgeBaseSearchResponse,
+    KbAskRequest,
+    KbAskResponse,
+    ProcessDemoRequest,
     ProcessLatestEmailRequest,
     ProcessLatestEmailResponse,
     ReplyTicketRequest,
@@ -68,6 +75,212 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Демо-письма для сида при первом запуске (веб-таблица не пустая)
+DEMO_EMAILS_SEED = [
+    {
+        "from_addr": "Иван Петров <ivan.petrov@zavod.ru>",
+        "subject": "Не запускается газоанализатор ДГС-210",
+        "body_preview": "Добрый день. После включения прибор не выходит на режим, на экране ошибка E-02. Подскажите, что проверить.",
+        "body": "Добрый день. После включения прибор не выходит на режим, на экране ошибка E-02. Подскажите, что проверить.",
+        "message_id": "<demo-seed-1@local>",
+        "to_addr": "support@eris.ru",
+    },
+    {
+        "from_addr": "Мария Сидорова <ms@example.com>",
+        "subject": "Запрос инструкции по настройке ЭРИС-230",
+        "body_preview": "Нужна инструкция по первичной настройке и калибровке. Спасибо.",
+        "body": "Нужна инструкция по первичной настройке и калибровке. Спасибо.",
+        "message_id": "<demo-seed-2@local>",
+        "to_addr": "support@eris.ru",
+    },
+]
+
+
+def _seed_demo_tickets_if_empty():
+    """Если тикетов нет — создаём несколько демо-тикетов с результатом ИИ."""
+    existing = list_tickets(limit=1)
+    if existing:
+        return
+    logger.info("Seeding demo tickets")
+    for item in DEMO_EMAILS_SEED:
+        ticket_id = _ingest_single_email(item)
+        ai_result = _run_ai_stub(item)
+        set_ai_result(ticket_id, ai_result)
+    logger.info("Demo tickets seeded")
+
+
+@app.on_event("startup")
+def startup_event():
+    logger.info("Initializing database schema")
+    init_db()
+    logger.info("Database schema initialized")
+    _seed_demo_tickets_if_empty()
+
+
+def _parse_confidence_from_reply(reply: str) -> tuple[str, int]:
+    """
+    Извлекает из конца ответа строку вида CONFIDENCE: N (0-100).
+    Возвращает (очищенный текст ответа без этой строки, уверенность 0-100 или 50 по умолчанию).
+    """
+    if not reply or not reply.strip():
+        return ("", 50)
+    lines = reply.strip().split("\n")
+    clean_lines = []
+    confidence = 50
+    for line in lines:
+        s = line.strip()
+        if s.upper().startswith("CONFIDENCE:"):
+            rest = s[10:].strip()
+            try:
+                n = int(rest.split()[0]) if rest else 50
+                confidence = max(0, min(100, n))
+            except (ValueError, IndexError):
+                pass
+            continue
+        clean_lines.append(line)
+    text = "\n".join(clean_lines).strip()
+    return (text, confidence)
+
+
+def _get_draft_from_kb_qwen(question: str, limit: int = 5) -> tuple[str, int, bool]:
+    """
+    Черновик ответа по базе знаний + Qwen. Главная задача ИИ — генерировать ответы.
+    Возвращает (текст черновика, уверенность 0-100, ответ найден в базе знаний).
+    При ответе не из KB просим Qwen указать уверенность (CONFIDENCE: N в конце).
+    """
+    question = (question or "").strip()
+    if not question:
+        return (
+            "Здравствуйте! Получили ваше обращение. Передали оператору, ответим в ближайшее время.",
+            50,
+            False,
+        )
+    entries = search_knowledge_base(query=question, limit=limit, use_vector=False)
+    if not entries:
+        # Ответ не в базе — Qwen генерирует ответ и указывает уверенность; при низкой не будем слать клиенту
+        system_no_kb = (
+            "Ты — вежливый сотрудник техподдержки. Напиши короткий ответ клиенту (2–3 предложения) на русском. "
+            "Не пиши, что «в базе знаний ничего не найдено». Не придумывай факты. "
+            "В последней строке напиши строго: CONFIDENCE: <число от 0 до 100> — насколько ты уверен в ответе "
+            "(без доступа к базе знаний; если не знаешь ответ или это специфичный вопрос компании — ставь низкую, 20-40)."
+        )
+        answer = ask_qwen(system_no_kb, question[:1500])
+        if answer and answer.strip():
+            draft, confidence = _parse_confidence_from_reply(answer)
+            if draft:
+                return (draft, confidence, False)
+            return (
+                "Здравствуйте! Получили ваше обращение. Ответим в ближайшее время.",
+                confidence,
+                False,
+            )
+        return (
+            "Здравствуйте! Получили ваше обращение и передали его оператору. Ответим в ближайшее время.",
+            50,
+            False,
+        )
+    system_prompt = (
+        "Ты — помощник техподдержки. Отвечай только на основе приведённой ниже информации из базы знаний. "
+        "Отвечай кратко, по существу, на русском языке. Не придумывай факты.\n\n"
+        + _build_kb_context(entries)
+    )
+    answer = ask_qwen(system_prompt, question)
+    first = entries[0]
+    # Уверенность из ранга поиска (эмбеддинги MiniLM / ts_rank) — единая шкала
+    raw_rank = first.get("rank")
+    if raw_rank is not None and isinstance(raw_rank, (int, float)):
+        confidence_pct = int(round(min(1.0, max(0.0, float(raw_rank))) * 100))
+    else:
+        confidence_pct = 75
+    # Ответ из базы — не опускаем ниже 51, иначе слабый ts_rank отправит в операторы
+    confidence_pct = max(confidence_pct, 51)
+    if answer:
+        return (answer.strip(), confidence_pct, True)
+    fallback = first.get("short_answer") or (first.get("content") or "")[:500]
+    if fallback:
+        return (fallback.strip(), confidence_pct, True)
+    return (
+        "Здравствуйте! Ответ по вашему запросу временно недоступен. Обратитесь к оператору.",
+        50,
+        True,
+    )
+
+
+def _qwen_needs_operator(text: str) -> bool | None:
+    """
+    Спрашивает Qwen: требуется ли передать обращение оператору.
+    True: негативный отзыв, жалоба, клиент просит оператора/человека, эскалация, срочность.
+    В таких случаях ИИ сама ничего не отправляет — только оператор.
+    """
+    if not (text and text.strip()):
+        return False
+    system = (
+        "Ты анализируешь обращение в техподдержку. Нужен ли живой оператор? "
+        "Ответь ДА если: негативный отзыв, жалоба, клиент просит оператора/человека, недовольство, эскалация, срочность. "
+        "Ответь НЕТ если: обычный вопрос без жалобы. Ответь строго одной строкой: ДА или НЕТ. Если ДА — на следующей строке кратко причину."
+    )
+    reply = ask_qwen(system, text.strip()[:2000])
+    if reply is None:
+        return None
+    first_line = (reply.split("\n")[0] or "").strip().upper()
+    if "ДА" in first_line or "YES" in first_line:
+        return True
+    if "НЕТ" in first_line or "NO" in first_line:
+        return False
+    return None
+
+
+def _run_ai_stub(email_item: dict) -> dict:
+    subject = str(email_item.get("subject", "")).strip()
+    from_addr = str(email_item.get("from_addr", "")).strip()
+    body_preview = str(email_item.get("body_preview", "")).strip()
+    text = f"{subject} {body_preview}".lower()
+    question_for_kb = f"{subject} {body_preview}".strip()[:2000]
+
+    if any(word in text for word in ("не работает", "ошибка", "авар", "срочно", "слом")):
+        priority = "Высокий"
+        category = "Инцидент / Неисправность"
+        tone = "Негативный"
+        needs_attention_fallback = True
+    elif any(word in text for word in ("как", "инструкция", "подключ", "настрой")):
+        priority = "Средний"
+        category = "Консультация / Настройка"
+        tone = "Нейтральный"
+        needs_attention_fallback = False
+    else:
+        priority = "Низкий"
+        category = "Общий запрос"
+        tone = "Нейтральный"
+        needs_attention_fallback = False
+
+    # ИИ всегда генерирует черновик; уверенность 0-100 решает, можно ли его отправить клиенту
+    draft_answer, confidence_pct, from_kb = _get_draft_from_kb_qwen(question_for_kb, limit=5)
+    confidence = confidence_pct / 100.0  # 0.0–1.0 для API
+
+    # Оператор нужен: негативный отзыв/жалоба/просьба оператора (Qwen) ИЛИ ИИ не уверена (<= 50)
+    needs_attention = _qwen_needs_operator(question_for_kb)
+    if needs_attention is None:
+        needs_attention = needs_attention_fallback
+    if not needs_attention and confidence_pct <= 50:
+        needs_attention = True  # ИИ не знает ответ — передаём оператору, сама не отправляет
+
+    # Черновик оператору всегда показываем (для редактирования). Клиенту не слать при needs_attention — решает UI/флоу отправки.
+
+    return {
+        "from_addr": from_addr or "unknown",
+        "subject": subject or "(без темы)",
+        "body_preview": body_preview or "(пустое письмо)",
+        "priority": priority,
+        "category": category,
+        "tone": tone,
+        "confidence": confidence,
+        "confidence_pct": confidence_pct,
+        "from_kb": from_kb,
+        "needs_attention": needs_attention,
+        "draft_answer": draft_answer,
+    }
 
 
 def _ingest_single_email(email_item: dict) -> int:
@@ -144,7 +357,7 @@ def api_send_email(req: SendEmailRequest):
     result = send_email(req.to, req.subject, req.body, req.body_html)
     if result.get("ok"):
         return SendEmailResponse(ok=True, to=result.get("to"))
-    raise HTTPException(status_code=400, detail=result.get("error", "Send failed"))
+    raise HTTPException(status_code=503, detail=STUB_SEND_MSG)
 
 
 @app.get("/emails")
@@ -163,7 +376,7 @@ def api_emails_sent(limit: int = 10):
 def api_ingest_emails(limit: int = 10, mailbox: str = "INBOX"):
     emails = fetch_recent_emails(limit=limit, mailbox=mailbox)
     if len(emails) == 1 and "error" in emails[0]:
-        raise HTTPException(status_code=400, detail=f"IMAP error: {emails[0]['error']}")
+        raise HTTPException(status_code=503, detail=STUB_MAIL_MSG)
 
     ingested = []
     for item in emails:
@@ -218,11 +431,105 @@ def api_reply_ticket(ticket_id: int, req: ReplyTicketRequest):
     )
 
     if not result.get("ok"):
-        raise HTTPException(status_code=400, detail=f"SMTP error: {result.get('error', 'unknown')}")
+        raise HTTPException(status_code=503, detail=STUB_SEND_MSG)
 
     mark_ticket_sent(ticket_id, req.body)
     logger.info("Ticket %s replied to %s", ticket_id, to_email)
     return {"ok": True, "ticket_id": ticket_id, "to": to_email, "port": result.get("port")}
+
+
+# --- База знаний (поиск для Qwen и клиентов) ---
+@app.get("/kb/search", response_model=KnowledgeBaseSearchResponse)
+def api_kb_search(q: str = "", limit: int = 5, use_vector: bool = False):
+    """
+    Поиск по базе знаний. use_vector=true — семантический поиск (нужны заполненные embedding).
+    """
+    entries = search_knowledge_base(query=q, limit=limit, use_vector=use_vector)
+    return KnowledgeBaseSearchResponse(
+        query=q,
+        count=len(entries),
+        entries=[KnowledgeBaseEntry(**e) for e in entries],
+    )
+
+
+@app.post("/kb/refresh-embeddings")
+def api_kb_refresh_embeddings():
+    """
+    Заполняет колонку embedding для всех записей knowledge_base, где она NULL.
+    Требуются HF_TOKEN и EMBEDDING_MODEL в .env. Долго при большом объёме.
+    """
+    updated, errors = fill_knowledge_base_embeddings()
+    return {"ok": True, "updated": updated, "errors": errors}
+
+
+def _build_kb_context(entries: list[dict]) -> str:
+    """Собирает контекст из записей БЗ для системного промпта Qwen."""
+    if not entries:
+        return "В базе знаний нет релевантных записей."
+    parts = []
+    for e in entries:
+        title = e.get("title") or "Без названия"
+        content = (e.get("content") or "").strip()
+        parts.append(f"--- Тема: {title} ---\n{content}")
+    return "\n\n".join(parts)
+
+
+@app.post("/kb/ask", response_model=KbAskResponse)
+def api_kb_ask(req: KbAskRequest):
+    """
+    Вопрос клиента → поиск в базе знаний → контекст в Qwen → ответ.
+    Если Qwen отключён или недоступен, возвращается short_answer первой подходящей записи (fallback=True).
+    """
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question не может быть пустым")
+
+    entries = search_knowledge_base(query=question, limit=req.limit, use_vector=req.use_vector)
+    source_ids = [e["id"] for e in entries]
+
+    if not entries:
+        system_no_kb = (
+            "Ты — вежливый сотрудник техподдержки. Напиши короткий ответ клиенту (2–3 предложения) на русском: "
+            "что обращение получено, при необходимости уточняем информацию, ответим в ближайшее время. "
+            "Не пиши, что «в базе знаний ничего не найдено». Не придумывай факты."
+        )
+        answer = ask_qwen(system_no_kb, question[:1500])
+        return KbAskResponse(
+            question=question,
+            answer=(answer and answer.strip()) or "Здравствуйте! Получили ваше обращение. Ответим в ближайшее время.",
+            source_ids=[],
+            fallback=True,
+        )
+
+    system_prompt = (
+        "Ты — помощник техподдержки. Отвечай только на основе приведённой ниже информации из базы знаний. "
+        "Отвечай кратко, по существу, на русском языке. Не придумывай факты.\n\n"
+        + _build_kb_context(entries)
+    )
+    answer = ask_qwen(system_prompt, question)
+
+    if answer:
+        return KbAskResponse(
+            question=question,
+            answer=answer,
+            source_ids=source_ids,
+            fallback=False,
+        )
+
+    # Fallback: первый short_answer или начало content
+    first = entries[0]
+    fallback_text = first.get("short_answer") or (first.get("content") or "")[:500]
+    if fallback_text:
+        fallback_text = fallback_text.strip()
+    if not fallback_text:
+        fallback_text = "Ответ по вашему запросу временно недоступен. Обратитесь к оператору."
+    logger.info("Qwen unavailable or empty response, using fallback for question=%s", question[:50])
+    return KbAskResponse(
+        question=question,
+        answer=fallback_text,
+        source_ids=source_ids,
+        fallback=True,
+    )
 
 
 @app.post("/tickets/{ticket_id}/save-to-kb")
@@ -287,34 +594,61 @@ def api_export_tickets(status: str | None = None):
     )
 
 
-# --- MVP: один цикл «забрать последнее письмо → AI → отправить оператору» ---
-def _do_mvp_process_latest(operator_email: str, mailbox: str = "INBOX") -> dict | None:
-    """Забирает последнее письмо, прогоняет через AI, шлёт черновик оператору. Возвращает None если писем нет или ошибка."""
-    emails = fetch_recent_emails(limit=1, mailbox=mailbox)
+# --- Existing MVP endpoint expanded with DB ---
+STUB_MAIL_MSG = "Подключение к почте не настроено. Функция будет доступна в следующей версии."
+STUB_SEND_MSG = "Отправка почты будет доступна после настройки. В разработке."
+
+
+@app.post("/mvp/process-latest", response_model=ProcessLatestEmailResponse)
+def api_mvp_process_latest(req: ProcessLatestEmailRequest):
+    operator_email = req.operator_email or os.getenv("OPERATOR_EMAIL")
+    if not operator_email:
+        raise HTTPException(
+            status_code=400,
+            detail="Укажите email оператора в поле на странице или настройте OPERATOR_EMAIL.",
+        )
+
+    emails = fetch_recent_emails(limit=1, mailbox=req.mailbox)
     if not emails:
-        return None
+        raise HTTPException(status_code=404, detail="В ящике нет писем.")
     if len(emails) == 1 and "error" in emails[0]:
-        logger.warning("MVP cycle: IMAP error %s", emails[0].get("error"))
-        return None
+        raise HTTPException(status_code=503, detail=STUB_MAIL_MSG)
+
     latest_email = emails[0]
-    ticket_id, ai_result = _process_email_to_ticket(latest_email)
-    operator_subject = f"[MVP][AI] {ai_result['subject']}"
+    msg_id = latest_email.get("message_id") or ""
+    if incoming_email_already_processed(msg_id):
+        logger.info("MVP skip: письмо уже обработано (message_id=%s)", msg_id[:50] if msg_id else "")
+        raise HTTPException(
+            status_code=409,
+            detail="Это письмо уже было обработано. Ответ не отправляется повторно.",
+        )
+
+    ticket_id = _ingest_single_email(latest_email)
+    ai_result = _run_ai_stub(latest_email)
+    set_ai_result(ticket_id, ai_result)
+
+    # Письмо только оператору; клиенту из этого эндпоинта ничего не отправляется
+    operator_subject = f"[Внутр. оператору] {ai_result['subject']}"
+    needs_op = ai_result.get("needs_attention", False)
+    draft_text = (ai_result.get("draft_answer") or "").strip()
+
     operator_body = (
         f"Ticket ID: {ticket_id}\n"
-        "MVP-обработка входящего письма\n\n"
         f"От: {ai_result['from_addr']}\n"
         f"Тема: {ai_result['subject']}\n"
         f"Категория: {ai_result['category']}\n"
         f"Приоритет: {ai_result['priority']}\n"
-        f"Уверенность: {ai_result['confidence']}\n"
-        f"Требуется внимание оператора: {ai_result['needs_attention']}\n"
-        f"Автоотправка разрешена: {ai_result['auto_send_allowed']}\n"
-        f"Причина автоотправки: {ai_result.get('auto_send_reason') or '-'}\n\n"
-        "Краткое содержимое письма:\n"
+        f"Уверенность: {ai_result['confidence']}\n\n"
+        "Содержимое письма клиента:\n"
         f"{ai_result['body_preview']}\n\n"
-        "Черновик ответа от AI:\n"
-        f"{ai_result['draft_answer']}\n"
     )
+    if draft_text:
+        operator_body += f"Черновик ответа (можно отредактировать и отправить клиенту):\n{draft_text}\n"
+        if needs_op:
+            operator_body += "\n⚠ Требуется внимание оператора. Клиенту автоматически не отправлять.\n"
+    else:
+        operator_body += "Черновик не сформирован. Требуется внимание оператора. Клиенту не отправлять.\n"
+
     send_result = send_email(operator_email, operator_subject, operator_body)
     create_email_log(
         ticket_id=ticket_id,
@@ -335,55 +669,9 @@ def _do_mvp_process_latest(operator_email: str, mailbox: str = "INBOX") -> dict 
         "operator_email": operator_email,
     }
 
+    if not send_result.get("ok"):
+        raise HTTPException(status_code=503, detail=STUB_SEND_MSG)
 
-def _poll_email_worker():
-    """Фоновый поток: каждые N секунд забирает последнее письмо и обрабатывает с AI."""
-    import time
-    interval = int(os.getenv("POLL_EMAIL_EVERY_SEC", "0"))
-    if interval <= 0:
-        return
-    operator_email = os.getenv("OPERATOR_EMAIL")
-    if not operator_email:
-        logger.warning("POLL_EMAIL_EVERY_SEC задан, но OPERATOR_EMAIL пуст — опрос почты отключён")
-        return
-    logger.info("Запуск фонового опроса почты каждые %s с, письма оператору: %s", interval, operator_email)
-    while True:
-        time.sleep(interval)
-        try:
-            result = _do_mvp_process_latest(operator_email, "INBOX")
-            if result:
-                logger.info("Опрос: обработан ticket_id=%s, отправлено оператору: %s", result["ticket_id"], result["operator_email"])
-        except Exception as e:
-            logger.exception("Опрос почты (ошибка): %s", e)
-
-
-@app.on_event("startup")
-def startup_event():
-    logger.info("Initializing database schema")
-    init_db()
-    logger.info("Database schema initialized")
-    poll_sec = int(os.getenv("POLL_EMAIL_EVERY_SEC", "0"))
-    if poll_sec > 0:
-        import threading
-        threading.Thread(target=_poll_email_worker, daemon=True).start()
-
-
-@app.post("/mvp/process-latest", response_model=ProcessLatestEmailResponse)
-def api_mvp_process_latest(req: ProcessLatestEmailRequest):
-    operator_email = req.operator_email or os.getenv("OPERATOR_EMAIL")
-    if not operator_email:
-        raise HTTPException(
-            status_code=400,
-            detail="Operator email is not set. Pass operator_email in request or set OPERATOR_EMAIL in env.",
-        )
-    result = _do_mvp_process_latest(operator_email, req.mailbox)
-    if result is None:
-        raise HTTPException(status_code=404, detail="No emails found in selected mailbox.")
-    ai_result = result["ai_result"]
-    ticket_id = result["ticket_id"]
-    send_ok = result["send_ok"]
-    if not send_ok:
-        raise HTTPException(status_code=400, detail="SMTP error when sending to operator.")
     logger.info("MVP processed ticket_id=%s and sent to operator=%s", ticket_id, operator_email)
     return ProcessLatestEmailResponse(
         ok=True,
@@ -405,54 +693,42 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
     )
 
 
-@app.post("/mvp/process-batch", response_model=ProcessBatchEmailsResponse)
-def api_mvp_process_batch(req: ProcessBatchEmailsRequest):
-    operator_email = req.operator_email or os.getenv("OPERATOR_EMAIL")
-    if req.notify_operator and not operator_email:
-        raise HTTPException(
-            status_code=400,
-            detail="Operator email is not set. Pass operator_email in request or set OPERATOR_EMAIL in env.",
-        )
-
-    emails = fetch_recent_emails(limit=req.limit, mailbox=req.mailbox)
-    if not emails:
-        return ProcessBatchEmailsResponse(ok=True, processed_count=0, ticket_ids=[])
-    if len(emails) == 1 and "error" in emails[0]:
-        raise HTTPException(status_code=400, detail=f"IMAP error: {emails[0]['error']}")
-
-    processed_ticket_ids = []
-    failures = []
-    for email_item in emails:
-        try:
-            ticket_id, _ = _process_email_to_ticket(email_item)
-            processed_ticket_ids.append(ticket_id)
-        except Exception as exc:
-            failures.append(str(exc))
-
-    digest_sent = False
-    if req.notify_operator and operator_email:
-        digest_subject = f"[MVP][AI-BATCH] processed={len(processed_ticket_ids)} failed={len(failures)}"
-        digest_body = (
-            "Результат batch-обработки писем:\n"
-            f"- mailbox: {req.mailbox}\n"
-            f"- processed: {len(processed_ticket_ids)}\n"
-            f"- failed: {len(failures)}\n"
-            f"- ticket_ids: {processed_ticket_ids}\n"
-        )
-        send_result = send_email(operator_email, digest_subject, digest_body)
-        digest_sent = bool(send_result.get("ok"))
-
-    return ProcessBatchEmailsResponse(
+@app.post("/mvp/process-demo", response_model=ProcessLatestEmailResponse)
+def api_mvp_process_demo(req: ProcessDemoRequest | None = Body(None)):
+    if req is None:
+        req = ProcessDemoRequest()
+    """
+    Демо без почты: «принимает» одно письмо (из тела запроса или шаблон),
+    обрабатывает ИИ и создаёт тикет. Показывается в веб-таблице и у оператора.
+    """
+    subject = (req.subject or "").strip() or "Демо-обращение с сайта"
+    body = (req.body or "").strip() or "Здравствуйте. Хочу уточнить порядок настройки прибора после установки. Спасибо."
+    from_addr = (req.from_addr or "").strip() or "Демо Клиент <demo@example.com>"
+    message_id = f"<demo-{uuid.uuid4().hex}@local>"
+    stub_email = {
+        "from_addr": from_addr,
+        "subject": subject,
+        "body_preview": body,
+        "body": body,
+        "message_id": message_id,
+        "to_addr": "support@eris.ru",
+    }
+    ticket_id = _ingest_single_email(stub_email)
+    ai_result = _run_ai_stub(stub_email)
+    set_ai_result(ticket_id, ai_result)
+    logger.info("Demo processed ticket_id=%s", ticket_id)
+    return ProcessLatestEmailResponse(
         ok=True,
-        processed_count=len(processed_ticket_ids),
-        ticket_ids=processed_ticket_ids,
-        failed_count=len(failures),
-        operator_email=operator_email,
-        digest_sent=digest_sent,
+        source_from=ai_result["from_addr"],
+        source_subject=ai_result["subject"],
+        operator_email="—",
+        ai_decision=f"{ai_result['category']} / {ai_result['priority']}",
+        ai_draft_response=ai_result["draft_answer"],
+        sent_via_port=None,
     )
 
 
-# Раздача фронта (index.html, operator.html и т.д.)
+# Раздача фронта (index.html, operator.html)
 _static_dir = Path(__file__).resolve().parent.parent / "front"
 if not _static_dir.is_dir():
     _static_dir = Path(__file__).resolve().parent / "static"

@@ -1,4 +1,5 @@
-const API_BASE = 'http://localhost:8000';
+// Относительный URL: работает и локально, и в Docker (один порт для фронта и API)
+const API_BASE = typeof window !== 'undefined' && window.location ? window.location.origin : '';
 const API_TICKETS = `${API_BASE}/tickets`;
 
 async function apiFetch(url, options = {}) {

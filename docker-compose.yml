@@ -1,4 +1,7 @@
-# Запуск бэкенда с почтой и PostgreSQL
+# Демо для жюри: после запуска откройте в браузере:
+#   http://localhost:8000          — веб-таблица (тикеты)
+#   http://localhost:8000/operator.html — панель оператора
+# Запуск: docker compose up --build -d
 services:
   postgres:
     image: postgres:16
@@ -19,7 +22,7 @@ services:
 
   backend:
     build:
-      context: ./backend
+      context: .
       dockerfile: Dockerfile
     depends_on:
       postgres:
@@ -34,6 +37,8 @@ services:
       - PGUSER=${PGUSER:-postgres}
       - PGPASSWORD=${PGPASSWORD:-postgres}
       - PGDATABASE=${PGDATABASE:-test}
+      # В Docker нет кэша моделей — используем Qwen через HF Inference API (HF_TOKEN из .env)
+      - QWEN_USE_LOCAL=false
     ports:
       - "8000:8000"
 

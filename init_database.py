@@ -5,7 +5,12 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
+
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None  # type: ignore
 
 # Подгрузка backend/.env, чтобы PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE были заданы
 _env_path = Path(__file__).resolve().parent / "backend" / ".env"
@@ -22,66 +27,152 @@ from psycopg import Connection as PgConnection
 from psycopg import sql
 
 
-FAQ_CSV_PATH = Path(__file__).resolve().parent / "_kb_extract" / "faq_база_знаний.csv"
+_project_root = Path(__file__).resolve().parent
+KB_XLSX_PATH = _project_root / "kb_test.xlsx"
+if not KB_XLSX_PATH.exists():
+    KB_XLSX_PATH = _project_root.parent / "kb_test.xlsx"
 
 
-def _seed_faq_from_csv(conn: PgConnection) -> None:
-    """Заполняет knowledge_base из _kb_extract/faq_база_знаний.csv (разделитель ;)."""
-    print("\n== FAQ ==")
-    print(f"Путь к CSV: {FAQ_CSV_PATH}")
-    if not FAQ_CSV_PATH.exists():
-        print(f"Файл не найден: {FAQ_CSV_PATH}")
-        print("Распакуйте Парсер_ЭРИС_база_знаний.zip и выполните python _kb_extract/build_faq.py для генерации FAQ.")
-        return
-    rows = []
-    with open(FAQ_CSV_PATH, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f, delimiter=";")
-        for row in reader:
-            q = (row.get("question_template") or "").strip()
-            a = (row.get("answer_template") or "").strip()
-            if not q or not a:
-                continue
-            cat = (row.get("category") or "").strip()
-            tags_str = (row.get("tags") or "").strip()
-            tags_list = [s.strip() for s in tags_str.split("|") if s.strip()] if tags_str else []
-            rows.append((q, a, a[:500] if len(a) > 500 else a, tags_list, cat or None))
-    if not rows:
-        print("В CSV нет записей (question_template/answer_template пустые).")
+def _normalize_header(h: Optional[str]) -> str:
+    return (h or "").strip().lower().replace(" ", "_")
+
+
+def _seed_kb_from_xlsx(conn: PgConnection) -> None:
+    """Заполняет knowledge_base из kb_test.xlsx: очищает старую вставку и вставляет строки из файла.
+    В колонку tags попадают шаблонные вопросы — примеры запросов пользователя, которые могут
+    привести к этой теме (например: вопрос «что даёт корова?» → тема «молоко»).
+    """
+    print("\n== База знаний из kb_test.xlsx ==")
+    print(f"Путь к файлу: {KB_XLSX_PATH}")
+    if not KB_XLSX_PATH.exists():
+        print(f"Файл не найден: {KB_XLSX_PATH}")
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM knowledge_base")
-            print(f"Всего записей в knowledge_base: {cur.fetchone()[0]}")
+            print(f"Записей в knowledge_base: {cur.fetchone()[0]}")
         return
+    if not openpyxl:
+        print("Установите openpyxl для чтения xlsx: pip install openpyxl")
+        return
+
+    wb = openpyxl.load_workbook(KB_XLSX_PATH, read_only=True, data_only=True)
+    ws = wb.active
+    if not ws:
+        wb.close()
+        print("В книге нет активного листа.")
+        return
+    rows_iter = ws.iter_rows(values_only=True)
+    header_row = next(rows_iter, None)
+    if not header_row:
+        wb.close()
+        print("Файл пустой.")
+        return
+    headers = [_normalize_header(str(h)) for h in header_row]
+    # Маппинг возможных названий колонок -> поля БД
+    # tags в БД = шаблонные вопросы (примеры запросов пользователя, которые приводят к этой теме)
+    title_keys = ("question_template", "question", "вопрос", "title", "заголовок")
+    content_keys = ("answer_template", "answer", "ответ", "content", "содержание", "текст")
+    cat_key = "category"
+    if "категория" in headers:
+        cat_key = "категория"
+    # Колонка с шаблонными вопросами (приводящими к этой теме); при отсутствии используем title
+    template_questions_keys = ("шаблонные_вопросы", "template_questions", "примеры_вопросов", "теги", "tags")
+
+    def col_index(keys: tuple) -> int:
+        for k in keys:
+            if k in headers:
+                return headers.index(k)
+        return -1
+
+    title_idx = col_index(title_keys)
+    content_idx = col_index(content_keys)
+    cat_idx = headers.index(cat_key) if cat_key in headers else -1
+    template_questions_idx = col_index(template_questions_keys)
+
+    if title_idx < 0 or content_idx < 0:
+        wb.close()
+        print("В xlsx нужны колонки для вопроса (question_template/question/вопрос/title) и ответа (answer_template/answer/ответ/content).")
+        return
+
+    rows = []
+    for row in rows_iter:
+        if not row or len(row) <= max(title_idx, content_idx):
+            continue
+        title_val = row[title_idx]
+        content_val = row[content_idx]
+        title = (title_val if title_val is not None else "").strip() if isinstance(title_val, str) else str(title_val or "").strip()
+        content = (content_val if content_val is not None else "").strip() if isinstance(content_val, str) else str(content_val or "").strip()
+        if not title or not content:
+            continue
+        short = content[:500] if len(content) > 500 else content
+        cat = None
+        if cat_idx >= 0 and cat_idx < len(row) and row[cat_idx] is not None:
+            cat = str(row[cat_idx]).strip() or None
+        # Шаблонные вопросы: фразы, которые пользователь мог бы спросить и попасть на эту тему
+        tags_list = []
+        if template_questions_idx >= 0 and template_questions_idx < len(row) and row[template_questions_idx]:
+            raw = str(row[template_questions_idx]).strip()
+            for s in raw.replace("|", ";").replace(",", ";").split(";"):
+                t = s.strip()
+                if t:
+                    tags_list.append(t)
+        if not tags_list:
+            tags_list = [title]
+        rows.append((title, content, short, tags_list, cat))
+    wb.close()
+
+    if not rows:
+        print("В xlsx нет подходящих строк (заполнены вопрос и ответ).")
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM knowledge_base")
+            print(f"Записей в knowledge_base: {cur.fetchone()[0]}")
+        return
+
     with conn.cursor() as cur:
-        # Колонка keywords есть только в схеме init_database; в backend/db её может не быть
-        try:
-            cur.execute(
-                "INSERT INTO knowledge_base (title, content, short_answer, tags, category, keywords) VALUES (%s, %s, %s, %s, %s, %s)",
-                (rows[0][0], rows[0][1], rows[0][2], rows[0][3], rows[0][4], rows[0][3]),
-            )
-            use_keywords = True
-        except Exception as e:
-            if "keywords" in str(e) or "column" in str(e).lower():
-                conn.rollback()
-                use_keywords = False
-            else:
-                raise
-        for i, (q, a, short, tags, cat) in enumerate(rows):
-            if use_keywords and i == 0:
-                continue  # уже вставлена в try
-            if use_keywords:
+        cur.execute("DELETE FROM knowledge_base")
+        deleted = cur.rowcount
+        print(f"Удалено предыдущих записей в knowledge_base: {deleted}")
+
+        # Проверяем наличие колонки keywords
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'knowledge_base'
+        """)
+        cols = {r[0] for r in cur.fetchall()}
+        has_keywords = "keywords" in cols
+        has_embedding = "embedding" in cols
+
+        def do_insert(row: tuple) -> None:
+            t, c, s, tags, cat = row
+            if has_embedding and has_keywords:
+                cur.execute(
+                    "INSERT INTO knowledge_base (title, content, short_answer, tags, category, keywords, embedding) VALUES (%s, %s, %s, %s, %s, %s, NULL)",
+                    (t, c, s, tags, cat or None, tags),
+                )
+            elif has_embedding:
+                cur.execute(
+                    "INSERT INTO knowledge_base (title, content, short_answer, tags, category, embedding) VALUES (%s, %s, %s, %s, %s, NULL)",
+                    (t, c, s, tags, cat or None),
+                )
+            elif has_keywords:
                 cur.execute(
                     "INSERT INTO knowledge_base (title, content, short_answer, tags, category, keywords) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (q, a, short, tags, cat, tags),
+                    (t, c, s, tags, cat or None, tags),
                 )
             else:
                 cur.execute(
                     "INSERT INTO knowledge_base (title, content, short_answer, tags, category) VALUES (%s, %s, %s, %s, %s)",
-                    (q, a, short, tags, cat),
+                    (t, c, s, tags, cat or None),
                 )
+
+        for row in rows:
+            do_insert(row)
         cur.execute("SELECT COUNT(*) FROM knowledge_base")
         total = cur.fetchone()[0]
-    print(f"Загружено записей из faq_база_знаний.csv: {len(rows)}")
+    print(f"Загружено записей из kb_test.xlsx: {len(rows)}")
     print(f"Всего записей в knowledge_base: {total}")
+    print("В колонке tags сохранены шаблонные вопросы (примеры запросов, приводящих к этой теме).")
+    if has_embedding:
+        print("Колонка embedding оставлена NULL — заполните через POST /kb/refresh-embeddings или скрипт.")
 
 
 def exec_many(conn: PgConnection, statements: Iterable[str], title: str) -> None:
@@ -168,21 +259,20 @@ def create_schema(
                 "Удаление старых таблиц",
             )
 
-        # Расширения: pg_trgm всегда, vector — опционально (pgvector)
+        # Расширения: pg_trgm всегда, vector (pgvector) — опционально
         vector_available = False
         with conn.cursor() as cur:
             print("\n== Расширения ==")
             print("[1] CREATE EXTENSION IF NOT EXISTS pg_trgm ...")
             cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
-
             print("[2] CREATE EXTENSION IF NOT EXISTS vector ...")
             try:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
                 vector_available = True
-                print("OK")
-            except psycopg.errors.FeatureNotSupported as e:
+                print("OK (pgvector)")
+            except Exception as e:
                 if "vector" in str(e).lower():
-                    print("(пропущено: pgvector не установлен — колонка embedding в knowledge_base не будет создана)")
+                    print("(пропущено: pgvector не установлен — колонка embedding не будет создана)")
                 else:
                     raise
 
@@ -234,19 +324,28 @@ def create_schema(
                         )
                     except Exception:
                         pass
+                # search_vector с конфигом 'russian' для морфологии и стемминга
                 try:
+                    cur.execute("DROP INDEX IF EXISTS idx_kb_search;")
+                    cur.execute("ALTER TABLE knowledge_base DROP COLUMN IF EXISTS search_vector;")
                     cur.execute("""
-                        ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS search_vector tsvector
+                        ALTER TABLE knowledge_base ADD COLUMN search_vector tsvector
                         GENERATED ALWAYS AS (
-                            setweight(to_tsvector('simple', coalesce(title,'')), 'A') ||
-                            setweight(to_tsvector('simple', coalesce(content,'')), 'B')
+                            setweight(to_tsvector('russian', coalesce(title,'')), 'A') ||
+                            setweight(to_tsvector('russian', coalesce(content,'')), 'B')
                         ) STORED;
                     """)
-                except Exception:
-                    pass
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_kb_search ON knowledge_base USING GIN (search_vector);")
+                except Exception as e:
+                    print("(search_vector для knowledge_base:", e, ")")
+                if vector_available:
+                    try:
+                        cur.execute(
+                            "ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS embedding vector(384);"
+                        )
+                    except Exception:
+                        pass
 
-        # Таблица knowledge_base: с колонкой embedding только при наличии pgvector
-        kb_embedding_col = "embedding vector(384)," if vector_available else ""
         schema_statements = [
             """
             CREATE TABLE IF NOT EXISTS operators (
@@ -317,7 +416,8 @@ def create_schema(
             "CREATE INDEX IF NOT EXISTS idx_email_log_message_id ON email_log(message_id);",
             "CREATE INDEX IF NOT EXISTS idx_email_log_direction ON email_log(direction);",
             "CREATE INDEX IF NOT EXISTS idx_email_log_created ON email_log(created_at DESC);",
-            f"""
+            (
+                """
             CREATE TABLE IF NOT EXISTS knowledge_base (
                 id SERIAL PRIMARY KEY,
                 title VARCHAR(500) NOT NULL,
@@ -325,19 +425,21 @@ def create_schema(
                 short_answer TEXT,
                 tags TEXT[],
                 category VARCHAR(100),
-                {kb_embedding_col}
-                keywords TEXT[],
+                """
+                + ("embedding vector(384),\n                " if vector_available else "")
+                + """keywords TEXT[],
                 usage_count INTEGER DEFAULT 0,
                 success_rate FLOAT DEFAULT 1.0,
                 is_active BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 search_vector tsvector GENERATED ALWAYS AS (
-                    setweight(to_tsvector('simple', coalesce(title,'')), 'A') ||
-                    setweight(to_tsvector('simple', coalesce(content,'')), 'B')
+                    setweight(to_tsvector('russian', coalesce(title,'')), 'A') ||
+                    setweight(to_tsvector('russian', coalesce(content,'')), 'B')
                 ) STORED
             );
-            """,
+            """
+            ),
             "CREATE INDEX IF NOT EXISTS idx_kb_tags ON knowledge_base USING GIN (tags);",
             "CREATE INDEX IF NOT EXISTS idx_kb_category ON knowledge_base(category);",
             "CREATE INDEX IF NOT EXISTS idx_kb_is_active ON knowledge_base(is_active);",
@@ -361,6 +463,18 @@ def create_schema(
         ]
 
         exec_many(conn, schema_statements, "Создание таблиц и индексов")
+
+        # Индекс для векторного поиска (семантика)
+        if vector_available:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_kb_embedding ON knowledge_base "
+                        "USING ivfflat (embedding vector_cosine_ops) WITH (lists = 1);"
+                    )
+                    print("Индекс idx_kb_embedding создан (при заполнении БЗ пересоздайте с lists ≈ sqrt(rows)).")
+                except Exception as e:
+                    print("(idx_kb_embedding:", e, ")")
 
         # Добавить колонки, если таблица создана старым скриптом без них
         with conn.cursor() as cur:
@@ -391,38 +505,6 @@ def create_schema(
                 VALUES ('operator@support.ru', 'Иван Петров'),
                        ('alex@support.ru', 'Алексей Смирнов')
                 ON CONFLICT (email) DO NOTHING;
-                """,
-                """
-                INSERT INTO knowledge_base (
-                    title, content, short_answer, tags, category, keywords
-                )
-                SELECT
-                    'Ошибка E21 на котле ThermoMax',
-                    'Код E21 означает перегрев теплообменника. Проверьте давление в системе, '
-                    || 'циркуляционный насос и очистите фильтр обратки.',
-                    'Проверьте давление и циркуляцию, затем перезапустите котел.',
-                    ARRAY['boiler', 'E21', 'overheat'],
-                    'hardware',
-                    ARRAY['перегрев', 'давление', 'насос', 'фильтр']
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM knowledge_base WHERE title = 'Ошибка E21 на котле ThermoMax'
-                );
-                """,
-                """
-                INSERT INTO knowledge_base (
-                    title, content, short_answer, tags, category, keywords
-                )
-                SELECT
-                    'Сброс пароля в личном кабинете',
-                    'Для сброса пароля используйте ссылку "Забыли пароль?" на странице входа. '
-                    || 'Письмо со ссылкой действует 15 минут.',
-                    'Используйте "Забыли пароль?" и ссылку из письма.',
-                    ARRAY['account', 'password', 'login'],
-                    'software',
-                    ARRAY['пароль', 'вход', 'личный кабинет']
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM knowledge_base WHERE title = 'Сброс пароля в личном кабинете'
-                );
                 """,
                 """
                 INSERT INTO tickets (
@@ -519,8 +601,8 @@ def create_schema(
             ]
             exec_many(conn, seed_statements, "Тестовые данные")
 
-            # Заполнение knowledge_base из FAQ (файл faq_база_знаний.csv)
-            _seed_faq_from_csv(conn)
+            # Заполнение knowledge_base из kb_test.xlsx (предыдущая вставка удаляется)
+            _seed_kb_from_xlsx(conn)
 
         print("\nГотово. База и таблицы созданы.")
     finally:

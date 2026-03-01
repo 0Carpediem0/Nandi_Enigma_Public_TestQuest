@@ -1,0 +1,7 @@
+# Минимум для демо в Docker: без torch/transformers (Qwen в контейнере выключен).
+# Полный requirements.txt — для локального запуска с ИИ.
+python-dotenv>=1.0.0
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+psycopg[binary]>=3.2.0
+openpyxl>=3.1.0
