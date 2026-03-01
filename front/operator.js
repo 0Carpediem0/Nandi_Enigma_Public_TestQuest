@@ -16,6 +16,11 @@ function setStatus(text) {
   if (node) node.textContent = text;
 }
 
+function setIngestStatus(text) {
+  const node = document.getElementById('ingestStatus');
+  if (node) node.textContent = text;
+}
+
 async function loadTickets() {
   const select = document.getElementById('ticketSelect');
   if (!select) return;
@@ -115,16 +120,42 @@ async function saveToKb() {
   }
 }
 
+async function processLatestEmail() {
+  const operatorEmail = document.getElementById('operatorEmail')?.value?.trim();
+  setIngestStatus('Обработка последнего письма ИИ…');
+  const btn = document.getElementById('processLatestBtn');
+  if (btn) btn.disabled = true;
+  try {
+    const body = operatorEmail
+      ? { mailbox: 'INBOX', operator_email: operatorEmail }
+      : { mailbox: 'INBOX' };
+    const data = await apiFetch(`${API_BASE}/mvp/process-latest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify(body),
+    });
+    setIngestStatus(`Готово. От: ${data.source_from || '-'}, тема: ${data.source_subject || '-'}. Черновик отправлен оператору.`);
+    await loadTickets();
+  } catch (error) {
+    const msg = error.message || '';
+    setIngestStatus(msg.includes('409') || msg.includes('уже') ? 'Письмо уже было обработано ранее.' : `Ошибка: ${msg}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const select = document.getElementById('ticketSelect');
   const updateBtn = document.getElementById('updateBtn');
   const replyBtn = document.getElementById('replyBtn');
   const kbBtn = document.getElementById('kbBtn');
+  const processLatestBtn = document.getElementById('processLatestBtn');
 
   if (select) select.addEventListener('change', hydrateFromSelected);
   if (updateBtn) updateBtn.addEventListener('click', updateTicket);
   if (replyBtn) replyBtn.addEventListener('click', sendReply);
   if (kbBtn) kbBtn.addEventListener('click', saveToKb);
+  if (processLatestBtn) processLatestBtn.addEventListener('click', processLatestEmail);
 
   loadTickets();
 });

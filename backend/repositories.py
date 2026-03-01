@@ -327,6 +327,19 @@ def create_kb_entry(
     return int(row["id"])
 
 
+def incoming_email_already_processed(message_id: str | None) -> bool:
+    """Проверяет, обрабатывали ли мы уже входящее письмо с этим message_id (есть запись в email_log)."""
+    if not (message_id and str(message_id).strip()):
+        return False
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM email_log WHERE message_id = %s AND direction = 'incoming' LIMIT 1",
+                (message_id.strip(),),
+            )
+            return cur.fetchone() is not None
+
+
 def create_email_log(
     ticket_id: int,
     raw_from: str,

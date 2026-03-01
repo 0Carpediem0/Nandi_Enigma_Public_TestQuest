@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from db import init_db
 from email_service import check_connection, fetch_recent_emails, fetch_recent_emails_sent, send_email
@@ -20,6 +21,7 @@ from repositories import (
     create_or_update_ticket_from_email,
     fill_knowledge_base_embeddings,
     get_ticket,
+    incoming_email_already_processed,
     list_tickets,
     mark_ticket_sent,
     search_knowledge_base,
@@ -76,21 +78,67 @@ def startup_event():
     logger.info("Database schema initialized")
 
 
-def _get_draft_from_kb_qwen(question: str, limit: int = 5) -> str:
+def _parse_confidence_from_reply(reply: str) -> tuple[str, int]:
     """
-    Черновик ответа по базе знаний + Qwen (та же логика, что в /kb/ask).
-    Если по запросу ничего не найдено или Qwen недоступен — возвращает fallback-текст.
+    Извлекает из конца ответа строку вида CONFIDENCE: N (0-100).
+    Возвращает (очищенный текст ответа без этой строки, уверенность 0-100 или 50 по умолчанию).
+    """
+    if not reply or not reply.strip():
+        return ("", 50)
+    lines = reply.strip().split("\n")
+    clean_lines = []
+    confidence = 50
+    for line in lines:
+        s = line.strip()
+        if s.upper().startswith("CONFIDENCE:"):
+            rest = s[10:].strip()
+            try:
+                n = int(rest.split()[0]) if rest else 50
+                confidence = max(0, min(100, n))
+            except (ValueError, IndexError):
+                pass
+            continue
+        clean_lines.append(line)
+    text = "\n".join(clean_lines).strip()
+    return (text, confidence)
+
+
+def _get_draft_from_kb_qwen(question: str, limit: int = 5) -> tuple[str, int, bool]:
+    """
+    Черновик ответа по базе знаний + Qwen. Главная задача ИИ — генерировать ответы.
+    Возвращает (текст черновика, уверенность 0-100, ответ найден в базе знаний).
+    При ответе не из KB просим Qwen указать уверенность (CONFIDENCE: N в конце).
     """
     question = (question or "").strip()
     if not question:
         return (
-            "Здравствуйте! Получили ваше обращение. Обратитесь к оператору для уточнения запроса."
+            "Здравствуйте! Получили ваше обращение. Передали оператору, ответим в ближайшее время.",
+            50,
+            False,
         )
     entries = search_knowledge_base(query=question, limit=limit, use_vector=False)
     if not entries:
+        # Ответ не в базе — Qwen генерирует ответ и указывает уверенность; при низкой не будем слать клиенту
+        system_no_kb = (
+            "Ты — вежливый сотрудник техподдержки. Напиши короткий ответ клиенту (2–3 предложения) на русском. "
+            "Не пиши, что «в базе знаний ничего не найдено». Не придумывай факты. "
+            "В последней строке напиши строго: CONFIDENCE: <число от 0 до 100> — насколько ты уверен в ответе "
+            "(без доступа к базе знаний; если не знаешь ответ или это специфичный вопрос компании — ставь низкую, 20-40)."
+        )
+        answer = ask_qwen(system_no_kb, question[:1500])
+        if answer and answer.strip():
+            draft, confidence = _parse_confidence_from_reply(answer)
+            if draft:
+                return (draft, confidence, False)
+            return (
+                "Здравствуйте! Получили ваше обращение. Ответим в ближайшее время.",
+                confidence,
+                False,
+            )
         return (
-            "Здравствуйте! По вашему запросу в базе знаний ничего не найдено. "
-            "Ответьте на это письмо или обратитесь к оператору."
+            "Здравствуйте! Получили ваше обращение и передали его оператору. Ответим в ближайшее время.",
+            50,
+            False,
         )
     system_prompt = (
         "Ты — помощник техподдержки. Отвечай только на основе приведённой ниже информации из базы знаний. "
@@ -98,15 +146,49 @@ def _get_draft_from_kb_qwen(question: str, limit: int = 5) -> str:
         + _build_kb_context(entries)
     )
     answer = ask_qwen(system_prompt, question)
-    if answer:
-        return answer
     first = entries[0]
+    # Уверенность из ранга поиска (эмбеддинги MiniLM / ts_rank) — единая шкала
+    raw_rank = first.get("rank")
+    if raw_rank is not None and isinstance(raw_rank, (int, float)):
+        confidence_pct = int(round(min(1.0, max(0.0, float(raw_rank))) * 100))
+    else:
+        confidence_pct = 75
+    # Ответ из базы — не опускаем ниже 51, иначе слабый ts_rank отправит в операторы
+    confidence_pct = max(confidence_pct, 51)
+    if answer:
+        return (answer.strip(), confidence_pct, True)
     fallback = first.get("short_answer") or (first.get("content") or "")[:500]
     if fallback:
-        return fallback.strip()
+        return (fallback.strip(), confidence_pct, True)
     return (
-        "Здравствуйте! Ответ по вашему запросу временно недоступен. Обратитесь к оператору."
+        "Здравствуйте! Ответ по вашему запросу временно недоступен. Обратитесь к оператору.",
+        50,
+        True,
     )
+
+
+def _qwen_needs_operator(text: str) -> bool | None:
+    """
+    Спрашивает Qwen: требуется ли передать обращение оператору.
+    True: негативный отзыв, жалоба, клиент просит оператора/человека, эскалация, срочность.
+    В таких случаях ИИ сама ничего не отправляет — только оператор.
+    """
+    if not (text and text.strip()):
+        return False
+    system = (
+        "Ты анализируешь обращение в техподдержку. Нужен ли живой оператор? "
+        "Ответь ДА если: негативный отзыв, жалоба, клиент просит оператора/человека, недовольство, эскалация, срочность. "
+        "Ответь НЕТ если: обычный вопрос без жалобы. Ответь строго одной строкой: ДА или НЕТ. Если ДА — на следующей строке кратко причину."
+    )
+    reply = ask_qwen(system, text.strip()[:2000])
+    if reply is None:
+        return None
+    first_line = (reply.split("\n")[0] or "").strip().upper()
+    if "ДА" in first_line or "YES" in first_line:
+        return True
+    if "НЕТ" in first_line or "NO" in first_line:
+        return False
+    return None
 
 
 def _run_ai_stub(email_item: dict) -> dict:
@@ -114,29 +196,36 @@ def _run_ai_stub(email_item: dict) -> dict:
     from_addr = str(email_item.get("from_addr", "")).strip()
     body_preview = str(email_item.get("body_preview", "")).strip()
     text = f"{subject} {body_preview}".lower()
+    question_for_kb = f"{subject} {body_preview}".strip()[:2000]
 
     if any(word in text for word in ("не работает", "ошибка", "авар", "срочно", "слом")):
         priority = "Высокий"
         category = "Инцидент / Неисправность"
-        confidence = 0.84
         tone = "Негативный"
-        needs_attention = True
+        needs_attention_fallback = True
     elif any(word in text for word in ("как", "инструкция", "подключ", "настрой")):
         priority = "Средний"
         category = "Консультация / Настройка"
-        confidence = 0.78
         tone = "Нейтральный"
-        needs_attention = False
+        needs_attention_fallback = False
     else:
         priority = "Низкий"
         category = "Общий запрос"
-        confidence = 0.66
         tone = "Нейтральный"
-        needs_attention = False
+        needs_attention_fallback = False
 
-    # Черновик ответа из базы знаний + Qwen (вопрос = тема + текст письма)
-    question_for_kb = f"{subject} {body_preview}".strip()[:2000]
-    draft_answer = _get_draft_from_kb_qwen(question_for_kb, limit=5)
+    # ИИ всегда генерирует черновик; уверенность 0-100 решает, можно ли его отправить клиенту
+    draft_answer, confidence_pct, from_kb = _get_draft_from_kb_qwen(question_for_kb, limit=5)
+    confidence = confidence_pct / 100.0  # 0.0–1.0 для API
+
+    # Оператор нужен: негативный отзыв/жалоба/просьба оператора (Qwen) ИЛИ ИИ не уверена (<= 50)
+    needs_attention = _qwen_needs_operator(question_for_kb)
+    if needs_attention is None:
+        needs_attention = needs_attention_fallback
+    if not needs_attention and confidence_pct <= 50:
+        needs_attention = True  # ИИ не знает ответ — передаём оператору, сама не отправляет
+
+    # Черновик оператору всегда показываем (для редактирования). Клиенту не слать при needs_attention — решает UI/флоу отправки.
 
     return {
         "from_addr": from_addr or "unknown",
@@ -146,6 +235,8 @@ def _run_ai_stub(email_item: dict) -> dict:
         "category": category,
         "tone": tone,
         "confidence": confidence,
+        "confidence_pct": confidence_pct,
+        "from_kb": from_kb,
         "needs_attention": needs_attention,
         "draft_answer": draft_answer,
     }
@@ -311,9 +402,15 @@ def api_kb_ask(req: KbAskRequest):
     source_ids = [e["id"] for e in entries]
 
     if not entries:
+        system_no_kb = (
+            "Ты — вежливый сотрудник техподдержки. Напиши короткий ответ клиенту (2–3 предложения) на русском: "
+            "что обращение получено, при необходимости уточняем информацию, ответим в ближайшее время. "
+            "Не пиши, что «в базе знаний ничего не найдено». Не придумывай факты."
+        )
+        answer = ask_qwen(system_no_kb, question[:1500])
         return KbAskResponse(
             question=question,
-            answer="По вашему запросу в базе знаний ничего не найдено. Обратитесь к оператору.",
+            answer=(answer and answer.strip()) or "Здравствуйте! Получили ваше обращение. Ответим в ближайшее время.",
             source_ids=[],
             fallback=True,
         )
@@ -424,24 +521,41 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         raise HTTPException(status_code=400, detail=f"IMAP error: {emails[0]['error']}")
 
     latest_email = emails[0]
+    msg_id = latest_email.get("message_id") or ""
+    if incoming_email_already_processed(msg_id):
+        logger.info("MVP skip: письмо уже обработано (message_id=%s)", msg_id[:50] if msg_id else "")
+        raise HTTPException(
+            status_code=409,
+            detail="Это письмо уже было обработано. Ответ не отправляется повторно.",
+        )
+
     ticket_id = _ingest_single_email(latest_email)
     ai_result = _run_ai_stub(latest_email)
     set_ai_result(ticket_id, ai_result)
 
-    operator_subject = f"[MVP] {ai_result['subject']}"
+    # Письмо только оператору; клиенту из этого эндпоинта ничего не отправляется
+    operator_subject = f"[Внутр. оператору] {ai_result['subject']}"
+    needs_op = ai_result.get("needs_attention", False)
+    draft_text = ai_result.get("draft_answer") or "(черновик не сформирован)"
     operator_body = (
+        "--- Это письмо только для оператора. Не пересылайте клиенту как есть. ---\n\n"
         f"Ticket ID: {ticket_id}\n"
         "Обработка входящего письма (база знаний + Qwen)\n\n"
         f"От: {ai_result['from_addr']}\n"
         f"Тема: {ai_result['subject']}\n"
         f"Категория: {ai_result['category']}\n"
         f"Приоритет: {ai_result['priority']}\n"
-        f"Уверенность: {ai_result['confidence']}\n\n"
-        "Содержимое письма:\n"
+        f"Уверенность: {ai_result['confidence']}\n"
+        f"Требуется внимание оператора: {'да' if needs_op else 'нет'}\n\n"
+        "Содержимое письма клиента:\n"
         f"{ai_result['body_preview']}\n\n"
-        "Черновик ответа (база знаний + Qwen):\n"
-        f"{ai_result['draft_answer']}\n"
+        "Черновик ответа (можно отредактировать и отправить клиенту):\n"
+        f"{draft_text}\n\n"
     )
+    if needs_op:
+        operator_body += (
+            "⚠ Требуется внимание оператора. Клиенту автоматически не отправлять.\n"
+        )
 
     send_result = send_email(operator_email, operator_subject, operator_body)
     create_email_log(
@@ -473,6 +587,15 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         ai_draft_response=ai_result["draft_answer"],
         sent_via_port=send_result.get("port"),
     )
+
+
+# Раздача фронта (index.html, operator.html)
+_static_dir = Path(__file__).resolve().parent.parent / "front"
+if not _static_dir.is_dir():
+    _static_dir = Path(__file__).resolve().parent / "static"
+if _static_dir.is_dir():
+    app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="static")
+    logger.info("Serving frontend from %s", _static_dir)
 
 
 if __name__ == "__main__":
