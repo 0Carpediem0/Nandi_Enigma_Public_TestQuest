@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Диалоги — ЭРИС</title>
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./dialogs.css">
+</head>
+<body class="dialogs_page">
+  <header class="header_eris">
+    <img src="./logo.svg" alt="Логотип ЭРИС" class="logo" />
+    <a class="nav_link_btn" href="./index.html">Веб-таблица</a>
+    <a class="nav_link_btn" href="./operator.html">Страница оператора</a>
+  </header>
+
+  <main class="dialogs_layout">
+    <aside class="dialogs_sidebar">
+      <h1 class="dialogs_sidebar_title">Диалоги</h1>
+      <input type="search" class="dialogs_search" id="dialogsSearch" placeholder="поиск..." aria-label="Поиск по контактам" />
+      <ul class="dialogs_list" id="dialogsList">
+        <li class="dialogs_item dialogs_item_active" data-user="X@sup.ru">
+          <div class="dialogs_item_avatar">
+            <span class="dialogs_avatar_placeholder">X</span>
+          </div>
+          <div class="dialogs_item_content">
+            <div class="dialogs_item_row">
+              <span class="dialogs_item_user">X@sup.ru</span>
+              <span class="dialogs_item_time">12:24</span>
+            </div>
+            <p class="dialogs_item_preview">Не включается насос...</p>
+            <div class="dialogs_item_status dialogs_status_ai">
+              <span class="dialogs_status_dot"></span>
+              <span>обработано AI</span>
+            </div>
+          </div>
+        </li>
+        <li class="dialogs_item" data-user="Z@sup.ru">
+          <div class="dialogs_item_avatar">
+            <span class="dialogs_avatar_placeholder">Z</span>
+          </div>
+          <div class="dialogs_item_content">
+            <div class="dialogs_item_row">
+              <span class="dialogs_item_user">Z@sup.ru</span>
+              <span class="dialogs_item_time">12:44</span>
+            </div>
+            <p class="dialogs_item_preview">Ошибка датчика...</p>
+            <div class="dialogs_item_status dialogs_status_process">
+              <span class="dialogs_status_dot"></span>
+              <span>в процессе</span>
+            </div>
+          </div>
+        </li>
+        <li class="dialogs_item" data-user="Y@sup.ru">
+          <div class="dialogs_item_avatar">
+            <span class="dialogs_avatar_placeholder">Y</span>
+          </div>
+          <div class="dialogs_item_content">
+            <div class="dialogs_item_row">
+              <span class="dialogs_item_user">Y@sup.ru</span>
+              <span class="dialogs_item_time">20:31</span>
+            </div>
+            <p class="dialogs_item_preview">Срочно нужна консультация...</p>
+            <div class="dialogs_item_status dialogs_status_operator">
+              <span class="dialogs_status_dot"></span>
+              <span>нужна помощь оператора</span>
+            </div>
+          </div>
+        </li>
+      </ul>
+    </aside>
+
+    <section class="dialogs_chat">
+      <header class="dialogs_chat_header">
+        <div class="dialogs_chat_user">
+          <div class="dialogs_chat_avatar">
+            <span class="dialogs_avatar_placeholder" id="chatAvatarLetter">X</span>
+          </div>
+          <span class="dialogs_chat_username" id="chatUsername">X@sup.ru</span>
+          <span class="dialogs_chat_online" aria-hidden="true"></span>
+        </div>
+        <button type="button" class="dialogs_chat_export" title="Экспорт в XLSX" id="exportChatBtn">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <path d="M8 13h2m0 0h2m-2 0v4m0-4h2m-2 0H8"/>
+          </svg>
+          <span>XLSX</span>
+        </button>
+      </header>
+
+      <div class="dialogs_chat_messages" id="chatMessages">
+        <!-- cообщения подставляются из dialogs.js -->
+      </div>
+
+      <div class="dialogs_chat_input_wrap">
+        <button type="button" class="dialogs_input_icon" id="dialogsAttachBtn" title="Прикрепить файл" aria-label="Прикрепить файл">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        </button>
+        <input type="file" id="dialogsFileInput" class="dialogs_file_input_hidden" accept="*" />
+        <div class="dialogs_attachment_preview" id="attachmentPreview"></div>
+        <input type="text" class="dialogs_chat_input" placeholder="Write a message..." id="chatInput" />
+        <div class="dialogs_emoji_wrap">
+          <button type="button" class="dialogs_input_icon" id="dialogsEmojiBtn" title="Эмодзи" aria-label="Эмодзи">😀</button>
+          <div class="dialogs_emoji_picker" id="emojiPicker" role="listbox" aria-label="Выбор смайлика"></div>
+        </div>
+        <button type="button" class="dialogs_send_btn" title="Отправить" id="sendMsgBtn" aria-label="Отправить сообщение">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" crossorigin="anonymous"></script>
+  <script src="./dialogs.js"></script>
+</body>
+</html>
