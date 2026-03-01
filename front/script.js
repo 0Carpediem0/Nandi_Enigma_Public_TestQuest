@@ -193,26 +193,39 @@ function setupLoginPopup() {
   const popup = document.querySelector('.pop_up');
   const saveButton = document.querySelector('.button_save');
   const demoAccessText = document.getElementById('demoAccessText');
-  
+  const navBtnDialogs = document.getElementById('nav_btn_dialogs');
+  const navBtnOperator = document.getElementById('nav_btn_operator');
+
   if (!popup) return;
-  
+
   const closePopup = () => {
     popup.classList.remove('is-open');
     document.body.classList.remove('modal-open');
     if (saveButton) {
       saveButton.disabled = false;
     }
-    // Скрываем "демодоступ" когда попап закрыт
+    if (navBtnDialogs) {
+      navBtnDialogs.style.display = '';
+    }
+    if (navBtnOperator) {
+      navBtnOperator.style.display = '';
+    }
     if (demoAccessText) {
       demoAccessText.closest('.demo_access_container').style.display = 'none';
     }
   };
-  
+
   const openPopup = () => {
     popup.classList.add('is-open');
     document.body.classList.add('modal-open');
     if (saveButton) {
       saveButton.disabled = true;
+    }
+    if (navBtnDialogs) {
+      navBtnDialogs.style.display = 'none';
+    }
+    if (navBtnOperator) {
+      navBtnOperator.style.display = 'none';
     }
     if (demoAccessText) {
       demoAccessText.closest('.demo_access_container').style.display = 'flex';
