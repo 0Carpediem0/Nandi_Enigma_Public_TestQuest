@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from email.utils import parseaddr
 from typing import Any
@@ -239,18 +240,74 @@ def search_knowledge_base(
                     """,
                     (query, query, limit),
                 )
+                rows = cur.fetchall()
+                if not rows:
+                    raise ValueError("no rows")
             except Exception:
-                cur.execute(
-                    """
-                    SELECT id, title, content, short_answer, category, 1.0 AS rank
-                    FROM knowledge_base
-                    WHERE is_active = TRUE
-                      AND (title ILIKE %s OR content ILIKE %s)
-                    LIMIT %s
-                    """,
-                    (pattern, pattern, limit),
-                )
-            rows = cur.fetchall()
+                rows = []
+            if not rows:
+                words = [
+                    w
+                    for w in re.split(r"\W+", query)
+                    if len(w) >= 2 and not any(c in w for c in "'&!()")
+                ]
+                words = words[:10]
+                if words:
+                    # OR по каждому слову через plainto_tsquery (надёжнее, чем to_tsquery с "a | b")
+                    or_ts = " | ".join(
+                        "plainto_tsquery('russian', %s)" for _ in words
+                    )
+                    try:
+                        cur.execute(
+                            f"""
+                            SELECT
+                                id, title, content, short_answer, category,
+                                1.0 AS rank
+                            FROM knowledge_base
+                            WHERE is_active = TRUE
+                              AND search_vector @@ ({or_ts})
+                            ORDER BY id
+                            LIMIT %s
+                            """,
+                            (*words, limit),
+                        )
+                        rows = cur.fetchall()
+                    except Exception:
+                        pass
+            if not rows:
+                try:
+                    cur.execute(
+                        """
+                        SELECT id, title, content, short_answer, category, 1.0 AS rank
+                        FROM knowledge_base
+                        WHERE is_active = TRUE
+                          AND (title ILIKE %s OR content ILIKE %s)
+                        LIMIT %s
+                        """,
+                        (pattern, pattern, limit),
+                    )
+                    rows = cur.fetchall()
+                except Exception:
+                    rows = []
+            if not rows and words:
+                for w in words:
+                    try:
+                        like_pat = f"%{w.replace('%', '\\%').replace('_', '\\_')}%"
+                        cur.execute(
+                            """
+                            SELECT id, title, content, short_answer, category, 1.0 AS rank
+                            FROM knowledge_base
+                            WHERE is_active = TRUE
+                              AND (title ILIKE %s OR content ILIKE %s)
+                            LIMIT %s
+                            """,
+                            (like_pat, like_pat, limit),
+                        )
+                        rows = cur.fetchall()
+                        if rows:
+                            break
+                    except Exception:
+                        continue
     return [_kb_row_to_dict(r) for r in rows]
 
 

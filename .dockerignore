@@ -1,0 +1,13 @@
+# Не копировать в образ
+.git
+.env
+*.pyc
+__pycache__
+.kb_extract
+docs
+*.md
+!backend/README.md
+terminals
+.cursor
+*.log
+.DS_Store

@@ -60,20 +60,27 @@ def _build_prompt(system: str, user_message: str) -> str:
 
 
 def _get_local_pipeline():
-    """Ленивая загрузка модели в процесс (один раз)."""
+    """Ленивая загрузка модели в процесс (один раз). Без скачивания: только кэш HF или QWEN_MODEL_PATH."""
     global _pipeline
     if _pipeline is not None:
         return _pipeline
-    model_name = os.getenv("QWEN_MODEL_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
-    logger.info("Loading Qwen in-process: %s (first call may download)", model_name)
+    model_path = os.getenv("QWEN_MODEL_PATH", "").strip()
+    if model_path and os.path.isdir(model_path):
+        model_arg = model_path
+        logger.info("Loading Qwen from local path: %s", model_path)
+    else:
+        model_arg = os.getenv("QWEN_MODEL_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
+        logger.info("Loading Qwen from cache (offline): %s", model_arg)
+        # Не качать: только из кэша. Если модели нет — будет ошибка, а не скачивание.
+        os.environ["HF_HUB_OFFLINE"] = "1"
     try:
         from transformers import pipeline
         _pipeline = pipeline(
             "text-generation",
-            model=model_name,
+            model=model_arg,
             torch_dtype="auto",
             device_map="auto",
-            model_kwargs={"trust_remote_code": True},
+            trust_remote_code=True,
         )
         return _pipeline
     except Exception as e:
@@ -103,37 +110,71 @@ def _ask_qwen_inprocess(system_prompt: str, user_message: str) -> str | None:
             pad_token_id=pipe.tokenizer.eos_token_id,
         )
         if not out or not isinstance(out, list) or len(out) == 0:
+            logger.warning("Qwen pipeline returned empty output")
             return None
         gen = out[0]
-        if isinstance(gen, dict) and "generated_text" in gen:
-            gt = gen["generated_text"]
-            # Qwen2 Instruct: list сообщений, нужен последний (assistant)
-            if isinstance(gt, list) and len(gt) > 0 and isinstance(gt[-1], dict):
-                return (gt[-1].get("content") or "").strip()
-            if isinstance(gt, str):
-                return gt.strip()
+        if not isinstance(gen, dict) or "generated_text" not in gen:
+            logger.warning("Qwen pipeline unexpected format: %s", type(gen))
+            return None
+        gt = gen["generated_text"]
+        # Qwen2.5 Instruct: list сообщений, последний — ответ ассистента
+        if isinstance(gt, list) and len(gt) > 0:
+            last = gt[-1]
+            if isinstance(last, dict):
+                text = last.get("content") or last.get("text") or ""
+                if text.strip():
+                    return text.strip()
+        # Иногда pipeline возвращает одну строку (весь текст)
+        if isinstance(gt, str) and gt.strip():
+            # Убираем промпт, оставляем только ответ ассистента
+            for marker in (f"{IM_END}\n", "assistant\n", "assistant"):
+                if marker in gt:
+                    tail = gt.split(marker)[-1]
+                    if tail.strip():
+                        return tail.split(IM_END)[0].strip()
+            return gt.strip()
+        logger.warning("Qwen pipeline could not extract reply from: %s", type(gt))
         return None
     except Exception as e:
         logger.exception("Qwen in-process generation failed: %s", e)
         return None
 
 
+# Демо-заглушка, когда Qwen выключен или недоступен — хоть что-то «от ИИ» в тикет
+_DEMO_STUB_PHRASES = [
+    "По вашему запросу: рекомендуем проверить раздел настройки и пункт 3.2 руководства. При необходимости уточните параметры.",
+    "Обращение принято. Типовые шаги: проверка питания, перезапуск, сверка с руководством. Дополнительно можем уточнить по логам.",
+    "Демо-ответ: по теме обращения — см. инструкцию, раздел «Неисправности». Если вопрос по калибровке — напишите модель прибора.",
+]
+
+def _demo_stub_reply(user_message: str) -> str:
+    """Возвращает короткий «ответ» для демо, когда реальный Qwen недоступен."""
+    msg = (user_message or "").strip()[:200]
+    idx = hash(msg) % len(_DEMO_STUB_PHRASES)
+    return _DEMO_STUB_PHRASES[idx]
+
+
 def ask_qwen(system_prompt: str, user_message: str) -> str | None:
     """
     Генерация ответа Qwen. Режим: in-process (QWEN_USE_LOCAL=true), локальный HTTP или облако HF.
+    Если Qwen выключен или запрос не удался — возвращается демо-заглушка (хоть что-то в черновик).
     """
     if not _is_enabled():
-        logger.info("Qwen disabled (QWEN_ENABLED != true)")
-        return None
+        logger.info("Qwen disabled, returning demo stub")
+        return _demo_stub_reply(user_message)
 
     if _use_local_inprocess():
-        return _ask_qwen_inprocess(system_prompt, user_message)
+        result = _ask_qwen_inprocess(system_prompt, user_message)
+        if result and result.strip():
+            return result
+        logger.warning("Qwen in-process returned empty, using demo stub")
+        return _demo_stub_reply(user_message)
 
     cfg = _get_config()
     use_local = bool(cfg["base_url"])
     if not use_local and not cfg["token"]:
-        logger.warning("HF_TOKEN not set and QWEN_BASE_URL empty, skipping Qwen call")
-        return None
+        logger.warning("HF_TOKEN not set and QWEN_BASE_URL empty, using demo stub")
+        return _demo_stub_reply(user_message)
 
     import json
     import urllib.error
@@ -199,11 +240,10 @@ def ask_qwen(system_prompt: str, user_message: str) -> str | None:
             if IM_END in text:
                 text = text.split(IM_END)[0]
             text = (text or "").strip()
-        return text if text else None
+        return text if text else _demo_stub_reply(user_message)
     except (OSError, urllib.error.URLError) as e:
-        # Сеть/DNS (getaddrinfo failed, timeout, connection refused) — без traceback
         logger.warning("Qwen API unreachable: %s", e)
-        return None
+        return _demo_stub_reply(user_message)
     except Exception as e:
         logger.exception("Qwen API request failed: %s", e)
-        return None
+        return _demo_stub_reply(user_message)

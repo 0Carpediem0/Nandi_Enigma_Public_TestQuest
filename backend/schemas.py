@@ -22,6 +22,13 @@ class ProcessLatestEmailRequest(BaseModel):
     )
 
 
+class ProcessDemoRequest(BaseModel):
+    """Демо-письмо без реальной почты: создаёт тикет и обрабатывает ИИ."""
+    subject: str | None = Field(None, description="Тема письма")
+    body: str | None = Field(None, description="Текст письма")
+    from_addr: str | None = Field(None, description="Email отправителя")
+
+
 class ProcessLatestEmailResponse(BaseModel):
     ok: bool
     source_from: str

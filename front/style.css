@@ -396,3 +396,15 @@ body.modal-open {
   cursor: not-allowed;
   pointer-events: none;
 }
+
+.operator_hint {
+  font-size: 0.9em;
+  color: #666;
+  margin-bottom: 0.5rem;
+}
+
+.ingest_status {
+  margin-top: 0.5rem;
+  font-size: 0.9em;
+  color: #444;
+}

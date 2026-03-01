@@ -14,12 +14,13 @@
 
   <main class="operator_layout">
     <section class="operator_card">
-      <h2>Операторская заглушка</h2>
-      <p>Здесь вынесены действия оператора: обновление тикета, отправка ответа, сохранение в базу знаний.</p>
+      <h2>Панель оператора</h2>
+      <p>Тикеты, ответы клиентам и база знаний. Часть функций (почта, ИИ) подключается при настройке — пока помечены как «в разработке».</p>
     </section>
 
     <section class="operator_card">
       <h3>Почта и ИИ</h3>
+      <p class="operator_hint">Будет доступно после настройки почты (IMAP/SMTP).</p>
       <div class="operator_grid">
         <div>
           <label for="operatorEmail">Email оператора (куда отправить черновик)</label>
@@ -27,7 +28,8 @@
         </div>
       </div>
       <div class="operator_actions" style="margin-top: 0.5rem;">
-        <button type="button" id="processLatestBtn">ИИ обработает последнее письмо</button>
+        <button type="button" id="processDemoBtn">Обработать демо-письмо (без почты)</button>
+        <button type="button" id="processLatestBtn">ИИ обработает последнее письмо из почты</button>
       </div>
       <p id="ingestStatus" class="ingest_status">—</p>
     </section>

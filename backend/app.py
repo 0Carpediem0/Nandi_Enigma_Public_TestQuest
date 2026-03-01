@@ -7,9 +7,10 @@ import csv
 import io
 import logging
 import os
+import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import Body, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -34,6 +35,7 @@ from schemas import (
     KnowledgeBaseSearchResponse,
     KbAskRequest,
     KbAskResponse,
+    ProcessDemoRequest,
     ProcessLatestEmailRequest,
     ProcessLatestEmailResponse,
     ReplyTicketRequest,
@@ -71,11 +73,46 @@ app.add_middleware(
 )
 
 
+# Демо-письма для сида при первом запуске (веб-таблица не пустая)
+DEMO_EMAILS_SEED = [
+    {
+        "from_addr": "Иван Петров <ivan.petrov@zavod.ru>",
+        "subject": "Не запускается газоанализатор ДГС-210",
+        "body_preview": "Добрый день. После включения прибор не выходит на режим, на экране ошибка E-02. Подскажите, что проверить.",
+        "body": "Добрый день. После включения прибор не выходит на режим, на экране ошибка E-02. Подскажите, что проверить.",
+        "message_id": "<demo-seed-1@local>",
+        "to_addr": "support@eris.ru",
+    },
+    {
+        "from_addr": "Мария Сидорова <ms@example.com>",
+        "subject": "Запрос инструкции по настройке ЭРИС-230",
+        "body_preview": "Нужна инструкция по первичной настройке и калибровке. Спасибо.",
+        "body": "Нужна инструкция по первичной настройке и калибровке. Спасибо.",
+        "message_id": "<demo-seed-2@local>",
+        "to_addr": "support@eris.ru",
+    },
+]
+
+
+def _seed_demo_tickets_if_empty():
+    """Если тикетов нет — создаём несколько демо-тикетов с результатом ИИ."""
+    existing = list_tickets(limit=1)
+    if existing:
+        return
+    logger.info("Seeding demo tickets")
+    for item in DEMO_EMAILS_SEED:
+        ticket_id = _ingest_single_email(item)
+        ai_result = _run_ai_stub(item)
+        set_ai_result(ticket_id, ai_result)
+    logger.info("Demo tickets seeded")
+
+
 @app.on_event("startup")
 def startup_event():
     logger.info("Initializing database schema")
     init_db()
     logger.info("Database schema initialized")
+    _seed_demo_tickets_if_empty()
 
 
 def _parse_confidence_from_reply(reply: str) -> tuple[str, int]:
@@ -271,7 +308,7 @@ def api_send_email(req: SendEmailRequest):
     result = send_email(req.to, req.subject, req.body, req.body_html)
     if result.get("ok"):
         return SendEmailResponse(ok=True, to=result.get("to"))
-    raise HTTPException(status_code=400, detail=result.get("error", "Send failed"))
+    raise HTTPException(status_code=503, detail=STUB_SEND_MSG)
 
 
 @app.get("/emails")
@@ -290,7 +327,7 @@ def api_emails_sent(limit: int = 10):
 def api_ingest_emails(limit: int = 10, mailbox: str = "INBOX"):
     emails = fetch_recent_emails(limit=limit, mailbox=mailbox)
     if len(emails) == 1 and "error" in emails[0]:
-        raise HTTPException(status_code=400, detail=f"IMAP error: {emails[0]['error']}")
+        raise HTTPException(status_code=503, detail=STUB_MAIL_MSG)
 
     ingested = []
     for item in emails:
@@ -345,7 +382,7 @@ def api_reply_ticket(ticket_id: int, req: ReplyTicketRequest):
     )
 
     if not result.get("ok"):
-        raise HTTPException(status_code=400, detail=f"SMTP error: {result.get('error', 'unknown')}")
+        raise HTTPException(status_code=503, detail=STUB_SEND_MSG)
 
     mark_ticket_sent(ticket_id, req.body)
     logger.info("Ticket %s replied to %s", ticket_id, to_email)
@@ -505,20 +542,24 @@ def api_export_tickets(status: str | None = None):
 
 
 # --- Existing MVP endpoint expanded with DB ---
+STUB_MAIL_MSG = "Подключение к почте не настроено. Функция будет доступна в следующей версии."
+STUB_SEND_MSG = "Отправка почты будет доступна после настройки. В разработке."
+
+
 @app.post("/mvp/process-latest", response_model=ProcessLatestEmailResponse)
 def api_mvp_process_latest(req: ProcessLatestEmailRequest):
     operator_email = req.operator_email or os.getenv("OPERATOR_EMAIL")
     if not operator_email:
         raise HTTPException(
             status_code=400,
-            detail="Operator email is not set. Pass operator_email in request or set OPERATOR_EMAIL in env.",
+            detail="Укажите email оператора в поле на странице или настройте OPERATOR_EMAIL.",
         )
 
     emails = fetch_recent_emails(limit=1, mailbox=req.mailbox)
     if not emails:
-        raise HTTPException(status_code=404, detail="No emails found in selected mailbox.")
+        raise HTTPException(status_code=404, detail="В ящике нет писем.")
     if len(emails) == 1 and "error" in emails[0]:
-        raise HTTPException(status_code=400, detail=f"IMAP error: {emails[0]['error']}")
+        raise HTTPException(status_code=503, detail=STUB_MAIL_MSG)
 
     latest_email = emails[0]
     msg_id = latest_email.get("message_id") or ""
@@ -536,26 +577,24 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
     # Письмо только оператору; клиенту из этого эндпоинта ничего не отправляется
     operator_subject = f"[Внутр. оператору] {ai_result['subject']}"
     needs_op = ai_result.get("needs_attention", False)
-    draft_text = ai_result.get("draft_answer") or "(черновик не сформирован)"
+    draft_text = (ai_result.get("draft_answer") or "").strip()
+
     operator_body = (
-        "--- Это письмо только для оператора. Не пересылайте клиенту как есть. ---\n\n"
         f"Ticket ID: {ticket_id}\n"
-        "Обработка входящего письма (база знаний + Qwen)\n\n"
         f"От: {ai_result['from_addr']}\n"
         f"Тема: {ai_result['subject']}\n"
         f"Категория: {ai_result['category']}\n"
         f"Приоритет: {ai_result['priority']}\n"
-        f"Уверенность: {ai_result['confidence']}\n"
-        f"Требуется внимание оператора: {'да' if needs_op else 'нет'}\n\n"
+        f"Уверенность: {ai_result['confidence']}\n\n"
         "Содержимое письма клиента:\n"
         f"{ai_result['body_preview']}\n\n"
-        "Черновик ответа (можно отредактировать и отправить клиенту):\n"
-        f"{draft_text}\n\n"
     )
-    if needs_op:
-        operator_body += (
-            "⚠ Требуется внимание оператора. Клиенту автоматически не отправлять.\n"
-        )
+    if draft_text:
+        operator_body += f"Черновик ответа (можно отредактировать и отправить клиенту):\n{draft_text}\n"
+        if needs_op:
+            operator_body += "\n⚠ Требуется внимание оператора. Клиенту автоматически не отправлять.\n"
+    else:
+        operator_body += "Черновик не сформирован. Требуется внимание оператора. Клиенту не отправлять.\n"
 
     send_result = send_email(operator_email, operator_subject, operator_body)
     create_email_log(
@@ -572,10 +611,7 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
     )
 
     if not send_result.get("ok"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"SMTP error: {send_result.get('error', 'unknown send error')}",
-        )
+        raise HTTPException(status_code=503, detail=STUB_SEND_MSG)
 
     logger.info("MVP processed ticket_id=%s and sent to operator=%s", ticket_id, operator_email)
     return ProcessLatestEmailResponse(
@@ -586,6 +622,41 @@ def api_mvp_process_latest(req: ProcessLatestEmailRequest):
         ai_decision=f"{ai_result['category']} / {ai_result['priority']}",
         ai_draft_response=ai_result["draft_answer"],
         sent_via_port=send_result.get("port"),
+    )
+
+
+@app.post("/mvp/process-demo", response_model=ProcessLatestEmailResponse)
+def api_mvp_process_demo(req: ProcessDemoRequest | None = Body(None)):
+    if req is None:
+        req = ProcessDemoRequest()
+    """
+    Демо без почты: «принимает» одно письмо (из тела запроса или шаблон),
+    обрабатывает ИИ и создаёт тикет. Показывается в веб-таблице и у оператора.
+    """
+    subject = (req.subject or "").strip() or "Демо-обращение с сайта"
+    body = (req.body or "").strip() or "Здравствуйте. Хочу уточнить порядок настройки прибора после установки. Спасибо."
+    from_addr = (req.from_addr or "").strip() or "Демо Клиент <demo@example.com>"
+    message_id = f"<demo-{uuid.uuid4().hex}@local>"
+    stub_email = {
+        "from_addr": from_addr,
+        "subject": subject,
+        "body_preview": body,
+        "body": body,
+        "message_id": message_id,
+        "to_addr": "support@eris.ru",
+    }
+    ticket_id = _ingest_single_email(stub_email)
+    ai_result = _run_ai_stub(stub_email)
+    set_ai_result(ticket_id, ai_result)
+    logger.info("Demo processed ticket_id=%s", ticket_id)
+    return ProcessLatestEmailResponse(
+        ok=True,
+        source_from=ai_result["from_addr"],
+        source_subject=ai_result["subject"],
+        operator_email="—",
+        ai_decision=f"{ai_result['category']} / {ai_result['priority']}",
+        ai_draft_response=ai_result["draft_answer"],
+        sent_via_port=None,
     )
 
 
